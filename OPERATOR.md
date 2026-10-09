@@ -30,17 +30,13 @@ both `sealedsecret-*.yaml` to `kustomization.yaml` resources.
 4. Add Flux entry (`deploy/apps/voice-enroll.yaml` in gitops) + image policy note below.
 5. Distribute `RESOLVE_EDGE_SECRET` to voice-bridge and `RESOLVE_TASKMASTER_SECRET` to taskmaster via their own SealedSecrets.
 
-## Image publishing (no CI yet)
+## Image publishing
 
-`ghcr.io/vranyes/voice-enroll:latest` has no publishing CI in any repo today
-(taskmaster/voice-bridge images were built out-of-band; taskmaster carries no
-workflow either). Until `.github/workflows/image.yaml` here runs once on push
-to main, build and push manually:
-
-```
-docker build -t ghcr.io/vranyes/voice-enroll:latest .
-docker push ghcr.io/vranyes/voice-enroll:latest
-```
+Images are built with `ko` in CI (`.github/workflows/build.yml`, driven by
+`make push`) and published to `ghcr.io/vranyes/voice-enroll:latest` on every
+merge to main. A `:latest` image already exists in GHCR (verified
+2026-10-08 via local `make ko`). No Dockerfile — `ko` builds from Go source
+directly onto the chainguard static base (`.ko.yaml`).
 
 The deployment carries the `# {"$imagepolicy": "flux-system:voice-enroll"}`
 annotation, so once Flux image-automation is configured it pins digests the

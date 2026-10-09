@@ -21,14 +21,17 @@ Reference: `PLAN.md` in `~/personal/taskmaster` (auth + isolation sections).
 Revocation: `POST /api/revoke` deletes the mapping; resolve reads PG live per
 request, so the next call denies. No caches in this service.
 
-## Develop
+## Develop (everything via make, same shape as voice-bridge)
 
 ```
-go test -race ./...   # httptest-backed: OTP/attempt-limit, resolve authz
-go vet ./...          # (edge-never-gets-key is asserted explicitly)
-gofmt -l .
-kustomize build deploy/k8s
+make build test vet fmt test-race manifests
+make ko      # local image build (publishes to $KO_DOCKER_REPO)
+make push    # CI path: push :latest to ghcr.io/vranyes/voice-enroll
 ```
+
+CI (`.github/workflows/build.yml`) runs the full suite on every push/PR and
+pushes `:latest` on merge to main. Images are built with `ko` on the
+chainguard static base (see `.ko.yaml`) — there is no Dockerfile.
 
 ## Layout
 

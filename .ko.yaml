@@ -1,0 +1,7 @@
+defaultBaseImage: cgr.dev/chainguard/static:latest
+builds:
+- id: voice-enroll
+  dir: ./cmd/voice-enroll
+  main: .
+  env:
+  - CGO_ENABLED=0

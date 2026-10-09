@@ -1,0 +1,26 @@
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-go@v5
+      with:
+        go-version: '1.27'
+    - run: make build
+    - run: make vet
+    - run: make fmt
+    - run: make test
+    - run: make test-race
+    - uses: ko-build/setup-ko@v0.9
+    - run: make push
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      env:
+        KO_DOCKER_REPO: ghcr.io/vranyes/voice-enroll
