@@ -2,6 +2,7 @@ package enroll
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 )
@@ -37,6 +38,10 @@ type Store interface {
 	OTPStore
 	UpsertEnrollment(ctx context.Context, e Enrollment) error
 	GetByPhone(ctx context.Context, phone string) (*Enrollment, error)
+	// ListBySub returns every enrollment owned by sub, ordered by phone.
+	// It backs the self-service "my numbers" list so a user who verifies a
+	// new number can still see and remove the old one.
+	ListBySub(ctx context.Context, sub string) ([]Enrollment, error)
 	// DeleteEnrollment removes the mapping only when both phone and sub
 	// match, so one user cannot revoke another's number.
 	DeleteEnrollment(ctx context.Context, phone, sub string) (bool, error)
@@ -86,6 +91,19 @@ func (s *memoryStore) GetByPhone(_ context.Context, phone string) (*Enrollment, 
 	}
 	c := e
 	return &c, nil
+}
+
+func (s *memoryStore) ListBySub(_ context.Context, sub string) ([]Enrollment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Enrollment
+	for _, e := range s.enrol {
+		if e.UserSub == sub {
+			out = append(out, e)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Phone < out[j].Phone })
+	return out, nil
 }
 
 func (s *memoryStore) DeleteEnrollment(_ context.Context, phone, sub string) (bool, error) {

@@ -107,6 +107,23 @@ FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &
 	return &e, nil
 }
 
+func (s *PGStore) ListBySub(ctx context.Context, sub string) ([]Enrollment, error) {
+	rows, err := s.pool.Query(ctx, `SELECT phone, user_sub, verified_at FROM enrollments WHERE user_sub=$1 ORDER BY phone`, sub)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Enrollment
+	for rows.Next() {
+		var e Enrollment
+		if err := rows.Scan(&e.Phone, &e.UserSub, &e.VerifiedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 func (s *PGStore) DeleteEnrollment(ctx context.Context, phone, sub string) (bool, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM enrollments WHERE phone=$1 AND user_sub=$2`, phone, sub)
 	if err != nil {

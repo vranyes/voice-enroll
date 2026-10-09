@@ -24,8 +24,11 @@ Reference: `PLAN.md` in `~/personal/taskmaster` (auth + isolation sections).
    input and wrong digits all deny identically — voice-bridge uses this to
    identify the caller per-enrollment (no global code).
 
-Revocation: `POST /api/revoke` deletes the mapping; resolve reads PG live per
-request, so the next call denies. No caches in this service.
+Revocation: `GET /api/enrollments` lists the caller's own numbers;
+`POST /api/revoke {"phone"}` deletes one entry (omitted = session's verified
+number). Delete is `(phone, sub)`-scoped so users cannot remove each other's
+numbers. Resolve reads PG live per request, so the next call denies. No
+caches in this service.
 
 ## Develop (everything via make, same shape as voice-bridge)
 

@@ -57,6 +57,7 @@ func (s *Server) PublicMux() *http.ServeMux {
 	m.HandleFunc("POST /api/otp/verify", s.handleOTPVerify)
 	m.HandleFunc("POST /api/grant", s.handleGrant)
 	m.HandleFunc("POST /api/revoke", s.handleRevoke)
+	m.HandleFunc("GET /api/enrollments", s.handleListEnrollments)
 	return m
 }
 
@@ -307,11 +308,33 @@ func phoneOf(sess Session) string { return sess.VerifiedPhone }
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.currentSession(r)
-	if !ok || sess.VerifiedPhone == "" {
-		http.Error(w, "login and verified number required", http.StatusUnauthorized)
+	if !ok {
+		http.Error(w, "login required", http.StatusUnauthorized)
 		return
 	}
-	okDeleted, err := s.store.DeleteEnrollment(r.Context(), sess.VerifiedPhone, sess.Sub)
+	// Revoking any of the caller's own numbers must not require the session
+	// to currently point at that number: after verifying a new number the
+	// old one stays active (enrollments are keyed by phone), and the user
+	// needs a path back to it. An explicit {"phone"} selects the entry;
+	// omitted keeps the legacy verified-number behavior.
+	var req struct {
+		Phone string `json:"phone"`
+	}
+	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req)
+	target := strings.TrimSpace(req.Phone)
+	if target == "" {
+		if sess.VerifiedPhone == "" {
+			http.Error(w, "login and verified number required", http.StatusUnauthorized)
+			return
+		}
+		target = sess.VerifiedPhone
+	}
+	phone, err := NormalizeE164(target)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	okDeleted, err := s.store.DeleteEnrollment(r.Context(), phone, sess.Sub)
 	if err != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -319,9 +342,44 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	// Deleting the mapping fails subsequent calls closed: resolve reads PG
 	// live per request (no cache in this service), so the next lookup 404s
 	// and the edge denies. LibreChat-key deletion likewise fails closed at
-	// use time when the caller presents the now-dead key.
+	// use time when the caller presents the now-dead key. The (phone, sub)
+	// scope in the store keeps one user from revoking another's number.
+	// If the revoked entry is the session's verified number, clear it so a
+	// stale session cannot grant again without re-verifying.
+	if okDeleted && phone == sess.VerifiedPhone {
+		sess.VerifiedPhone = ""
+		s.setSession(w, sess)
+	}
 	log.Printf("revoke sub=%s deleted=%v", hashID(sess.Sub), okDeleted)
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"deleted": okDeleted})
+}
+
+// handleListEnrollments returns the caller's own enrolled numbers so the UI
+// can show every active entry — including numbers verified before the
+// session's current one — each removable via POST /api/revoke {"phone"}.
+// Login required; the store scopes rows by sub, so no cross-user leakage.
+func (s *Server) handleListEnrollments(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.currentSession(r)
+	if !ok {
+		http.Error(w, "login required", http.StatusUnauthorized)
+		return
+	}
+	rows, err := s.store.ListBySub(r.Context(), sess.Sub)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	type entry struct {
+		Phone      string `json:"phone"`
+		VerifiedAt string `json:"verified_at"`
+	}
+	out := make([]entry, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, entry{Phone: e.Phone, VerifiedAt: e.VerifiedAt.UTC().Format(time.RFC3339)})
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{"phones": out})
 }
 
 // handleResolve is the internal directory the call path queries at runtime.
@@ -435,9 +493,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		`#status.ok{color:#0a7d2c}#status.err{color:#b00020}` +
 		`.pill{display:inline-block;font-size:13px;background:#eef7ee;color:#0a7d2c;border-radius:999px;padding:2px 10px}` +
 		`a.btn{display:inline-block;padding:10px 16px;border-radius:8px;background:#1a1a1a;color:#fff;text-decoration:none}` +
+		`ul.numbers{padding-left:20px;margin:8px 0}ul.numbers li{margin:6px 0}ul.numbers li button{padding:4px 10px;font-size:13px;margin-left:8px}` +
 		`</style></head><body><main><h1>Voice enrollment</h1>` +
 		`<p class="sub">Verify a number, then grant it voice access.</p>` +
 		`<p id="status" role="status"></p>`)
+	enrolledCard := `<div class="card"><h2>Enrolled numbers</h2>` +
+		`<p class="sub">All numbers with voice access under your account — including numbers verified before this session. Removing one denies its calls.</p>` +
+		`<div id="enrolled"><p class="sub">Loading…</p></div></div>`
 	if !loggedIn {
 		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
 			`<p class="sub">Kanidm confirms who you are.</p>` +
@@ -450,18 +512,20 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`<label for="code">6-digit code from SMS</label>` +
 			`<input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6">` +
 			`<div class="row"><button id="verify">Verify</button></div></div>` +
+			enrolledCard +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	} else {
 		b.WriteString(`<div class="card"><h2>Step 2 — Number verified</h2><p><span class="pill">` +
 			html.EscapeString(sess.VerifiedPhone) + `</span></p></div>` +
 			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
-			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
+			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification. Granting a new number keeps your existing numbers active — remove any you no longer use below.</p>` +
 			`<label for="apikey">LibreChat API key</label>` +
 			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
 			`<label for="pin">Voice PIN (4-12 digits)</label>` +
 			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
 			`<div class="row"><button id="grant">Grant access</button>` +
-			`<button id="revoke" class="secondary">Revoke access</button></div></div>` +
+			`<button id="revoke" class="secondary">Revoke this number</button></div></div>` +
+			enrolledCard +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
 	b.WriteString(`</main><script>
@@ -473,14 +537,39 @@ async function post(url,body){
   return r;
 }
 function phoneVal(){const el=document.getElementById('phone');return el?el.value:'';}
+async function refreshEnrolled(){
+  const box=document.getElementById('enrolled');
+  if(!box)return;
+  try{
+    const r=await fetch('/api/enrollments');
+    if(!r.ok)throw new Error('load failed: '+r.status);
+    const data=await r.json();
+    box.textContent='';
+    if(!data.phones||!data.phones.length){box.innerHTML='<p class="sub">None yet.</p>';return;}
+    const ul=document.createElement('ul');
+    ul.className='numbers';
+    data.phones.forEach(function(p){
+      const li=document.createElement('li');
+      li.appendChild(document.createTextNode(p.phone+' '));
+      const btn=document.createElement('button');
+      btn.textContent='Remove';
+      btn.className='secondary';
+      btn.onclick=async function(){say('Revoking '+p.phone+'…');try{await post('/api/revoke',{phone:p.phone});say('Removed '+p.phone+'.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
+      li.appendChild(btn);
+      ul.appendChild(li);
+    });
+    box.appendChild(ul);
+  }catch(e){box.textContent='Could not load enrolled numbers.';}
+}
+refreshEnrolled();
 const send=document.getElementById('send');
 if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',{phone:phoneVal()});say('Code sent — check SMS.','ok');}catch(e){say(e.message,'err');}};
 const verify=document.getElementById('verify');
 if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});say('Verified.','ok');location.reload();}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
-if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});say('Voice access granted.','ok');}catch(e){say(e.message,'err');}};
+if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
 const revoke=document.getElementById('revoke');
-if(revoke)revoke.onclick=async()=>{say('Revoking…');try{await post('/api/revoke',{});say('Access revoked.','ok');}catch(e){say(e.message,'err');}};
+if(revoke)revoke.onclick=async()=>{say('Revoking…');try{await post('/api/revoke',{});say('Access revoked.','ok');location.reload();}catch(e){say(e.message,'err');}};
 </script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
