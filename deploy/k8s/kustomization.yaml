@@ -1,0 +1,14 @@
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: voice-enroll
+resources:
+- cluster.yaml
+- deployment.yaml
+- httproute.yaml
+- namespace.yaml
+- oauth2client.yaml
+- service.yaml
+# sealedsecret-app.yaml + sealedsecret-pg.yaml join this list once the
+# operator seals real values (see *.example + OPERATOR.md). They are
+# deliberately absent so the app never deploys half-configured.

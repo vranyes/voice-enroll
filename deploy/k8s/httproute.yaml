@@ -1,0 +1,22 @@
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: traefik-route
+spec:
+  hostnames:
+  - enroll.vranyes.com
+  parentRefs:
+  - name: traefik-gateway
+    namespace: traefik
+  rules:
+  # Public browser route ONLY. There is deliberately no route for the
+  # internal resolve port (8082): it stays ClusterIP-only so key material
+  # can never leave the cluster over ingress.
+  - backendRefs:
+    - name: voice-enroll-svc
+      port: 8080
+    matches:
+    - path:
+        type: PathPrefix
+        value: /

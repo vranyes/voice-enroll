@@ -1,0 +1,23 @@
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: voice-enroll-pg
+spec:
+  bootstrap:
+    initdb:
+      database: voiceenroll
+      owner: enroll
+      secret:
+        name: voice-enroll-pg-credentials
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.8
+  instances: 1
+  resources:
+    limits:
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+  storage:
+    size: 5Gi
+    storageClass: democratic-zfs-iscsi

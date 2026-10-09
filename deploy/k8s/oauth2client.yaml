@@ -1,0 +1,24 @@
+---
+apiVersion: kaniop.rs/v1beta1
+kind: KanidmOAuth2Client
+metadata:
+  name: voice-enroll-app
+  namespace: voice-enroll
+spec:
+  # Consent prompt stays ENABLED: the user must explicitly approve this
+  # client at login (threat-model requirement).
+  disableConsentPrompt: false
+  displayname: Voice Enrollment
+  kanidmRef:
+    name: auth
+    namespace: kaniop
+  origin: https://enroll.vranyes.com
+  preferShortUsername: true
+  redirectUrl:
+  - https://enroll.vranyes.com/oauth/callback
+  scopeMap:
+  - group: idm_all_persons
+    scopes:
+    - email
+    - openid
+    - profile

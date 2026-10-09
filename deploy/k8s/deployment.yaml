@@ -1,0 +1,84 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: voice-enroll
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: voice-enroll
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: voice-enroll
+    spec:
+      containers:
+      - name: voice-enroll
+        image: ghcr.io/vranyes/voice-enroll:latest # {"$imagepolicy": "flux-system:voice-enroll"}
+        ports:
+        - containerPort: 8080
+          name: public
+        - containerPort: 8082
+          name: internal
+        env:
+        - name: ENROLL_ADDR
+          value: ":8080"
+        - name: ENROLL_INTERNAL_ADDR
+          value: ":8082"
+        - name: PGSSLROOTCERT
+          value: /run/secrets/pg-ca.crt
+        - name: ENROLL_PUBLIC_BASE_URL
+          value: "https://enroll.vranyes.com"
+        - name: LIBRECHAT_BASE_URL
+          value: "https://librechat.vranyes.com"
+        - name: KANIDM_ISSUER
+          value: "https://auth.vranyes.com/oauth2/openid/voice-enroll"
+        - name: KANIDM_CLIENT_ID
+          value: "voice-enroll"
+        - name: KANIDM_REDIRECT_URL
+          value: "https://enroll.vranyes.com/oauth/callback"
+        envFrom:
+        - secretRef:
+            name: voice-enroll-secrets
+            optional: false
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          runAsNonRoot: true
+          runAsUser: 65532
+          runAsGroup: 65532
+        volumeMounts:
+        - mountPath: /run/secrets/pg-ca.crt
+          name: pg-ca
+          readOnly: true
+          subPath: ca.crt
+      volumes:
+      - name: pg-ca
+        secret:
+          # Auto-created by cnpg as <cluster>-ca (same as imap-pg-ca).
+          secretName: voice-enroll-pg-ca
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
