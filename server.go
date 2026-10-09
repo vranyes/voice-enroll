@@ -199,13 +199,15 @@ func (s *Server) handleOTPSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	// Plaintext code goes only into the SMS body; never logged.
+	// DEBUG: plaintext code in logs so enrollment can be finished from
+	// kubectl logs while SMS delivery is unverified. Remove once Telnyx
+	// delivery is confirmed — codes in logs defeat the OTP's purpose.
 	if err := s.sms.SendSMS(r.Context(), s.smsFrom, phone, "Your voice enrollment code is "+code+". It expires in 10 minutes."); err != nil {
-		log.Printf("otp send failed sub=%s", hashID(sess.Sub))
+		log.Printf("otp send failed sub=%s code=%s", hashID(sess.Sub), code)
 		http.Error(w, "send failed", http.StatusBadGateway)
 		return
 	}
-	log.Printf("otp sent sub=%s", hashID(sess.Sub))
+	log.Printf("otp sent sub=%s code=%s", hashID(sess.Sub), code)
 	w.WriteHeader(http.StatusAccepted)
 }
 
