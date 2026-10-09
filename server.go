@@ -141,7 +141,9 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	sub, _, err := s.oidc.Exchange(r.Context(), q.Get("code"), nn.Value, pkv.Value)
 	if err != nil {
-		log.Printf("callback: exchange failed for sub=%s", "unknown")
+		// Safe to log: Exchange errors carry status codes and claim
+		// mismatches only, never secrets, codes, or verifiers.
+		log.Printf("callback: exchange failed: %v", err)
 		http.Error(w, "login failed", http.StatusUnauthorized)
 		return
 	}
