@@ -300,6 +300,11 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	// The pending verification is consumed: the number is now enrolled, so
+	// return the session to the clean list state. Updating the key/PIN later
+	// re-verifies ownership via SMS first.
+	sess.VerifiedPhone = ""
+	s.setSession(w, sess)
 	log.Printf("grant stored sub=%s", hashID(sess.Sub))
 	w.WriteHeader(http.StatusCreated)
 }
@@ -497,34 +502,45 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		`</style></head><body><main><h1>Voice enrollment</h1>` +
 		`<p class="sub">Verify a number, then grant it voice access.</p>` +
 		`<p id="status" role="status"></p>`)
-	enrolledCard := `<div class="card"><h2>Enrolled numbers</h2>` +
-		`<p class="sub">All numbers with voice access under your account — including numbers verified before this session. Removing one denies its calls.</p>` +
+	enrolledCard := `<div class="card"><h2>Enrolled phone numbers</h2>` +
+		`<p class="sub">All numbers with voice access under your account. Removing one denies its calls.</p>` +
 		`<div id="enrolled"><p class="sub">Loading…</p></div></div>`
-	if !loggedIn {
-		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
-			`<p class="sub">Kanidm confirms who you are.</p>` +
-			`<div class="row"><a class="btn" href="/login">Log in with Kanidm</a></div></div>`)
-	} else if sess.VerifiedPhone == "" {
-		b.WriteString(`<div class="card"><h2>Step 2 — Verify your number</h2>` +
+	verifyCard := func(hidden bool) string {
+		hide := ""
+		if hidden {
+			hide = " hidden"
+		}
+		return `<div class="card" id="verifyCard"` + hide + `><h2>Step 2 — Verify your number</h2>` +
 			`<label for="phone">Phone number</label>` +
 			`<input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+15550109999">` +
 			`<div class="row"><button id="send">Send code</button></div>` +
 			`<label for="code">6-digit code from SMS</label>` +
 			`<input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6">` +
-			`<div class="row"><button id="verify">Verify</button></div></div>` +
-			enrolledCard +
+			`<div class="row"><button id="verify">Verify</button></div></div>`
+	}
+	if !loggedIn {
+		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
+			`<p class="sub">Kanidm confirms who you are.</p>` +
+			`<div class="row"><a class="btn" href="/login">Log in with Kanidm</a></div></div>`)
+	} else if sess.VerifiedPhone == "" {
+		b.WriteString(enrolledCard +
+			`<div class="card"><h2>Enroll new phone number</h2>` +
+			`<p class="sub">Verify ownership via SMS, then grant voice access. Numbers you already enrolled stay active.</p>` +
+			`<div class="row"><button id="enrollNew">Enroll new phone number</button></div></div>` +
+			verifyCard(true) +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	} else {
 		b.WriteString(`<div class="card"><h2>Step 2 — Number verified</h2><p><span class="pill">` +
 			html.EscapeString(sess.VerifiedPhone) + `</span></p></div>` +
 			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
-			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification. Granting a new number keeps your existing numbers active — remove any you no longer use below.</p>` +
+			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
 			`<label for="apikey">LibreChat API key</label>` +
 			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
 			`<label for="pin">Voice PIN (4-12 digits)</label>` +
 			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
 			`<div class="row"><button id="grant">Grant access</button>` +
-			`<button id="revoke" class="secondary">Revoke this number</button></div></div>` +
+			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>` +
+			verifyCard(true) +
 			enrolledCard +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
@@ -562,14 +578,16 @@ async function refreshEnrolled(){
   }catch(e){box.textContent='Could not load enrolled numbers.';}
 }
 refreshEnrolled();
+const enrollNew=document.getElementById('enrollNew');
+if(enrollNew)enrollNew.onclick=()=>{const vc=document.getElementById('verifyCard');if(vc)vc.hidden=false;enrollNew.closest('.card').hidden=true;};
+const useDifferent=document.getElementById('useDifferent');
+if(useDifferent)useDifferent.onclick=()=>{const vc=document.getElementById('verifyCard');if(vc)vc.hidden=!vc.hidden;};
 const send=document.getElementById('send');
 if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',{phone:phoneVal()});say('Code sent — check SMS.','ok');}catch(e){say(e.message,'err');}};
 const verify=document.getElementById('verify');
-if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});say('Verified.','ok');location.reload();}catch(e){say(e.message,'err');}};
+if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});location.reload();}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
-if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
-const revoke=document.getElementById('revoke');
-if(revoke)revoke.onclick=async()=>{say('Revoking…');try{await post('/api/revoke',{});say('Access revoked.','ok');location.reload();}catch(e){say(e.message,'err');}};
+if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});location.reload();}catch(e){say(e.message,'err');}};
 </script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))

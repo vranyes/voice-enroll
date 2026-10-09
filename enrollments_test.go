@@ -123,6 +123,89 @@ func TestRevokeExplicitPhoneCannotDeleteOthers(t *testing.T) {
 	}
 }
 
+func TestGrantClearsPendingVerification(t *testing.T) {
+	s, _ := testServer(t)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fake.Close()
+	s.libreChat = fake.URL
+	s.httpClient = fake.Client()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/grant",
+		strings.NewReader(`{"api_key":"good","pin":"482916"}`))
+	req.AddCookie(loginAs(s, "sub-1", "+15550109999"))
+	rr := httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("grant: status %d, want 201", rr.Code)
+	}
+	var granted *http.Cookie
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == "enroll_session" {
+			granted = c
+		}
+	}
+	if granted == nil {
+		t.Fatal("grant did not refresh the session cookie")
+	}
+	// Back to the clean main view: enrolled list + enroll-new entry point,
+	// no pending grant form for the just-enrolled number.
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(granted)
+	rrec := httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rrec, req)
+	body := rrec.Body.String()
+	if !strings.Contains(body, "Enrolled phone numbers") || !strings.Contains(body, "Enroll new phone number") {
+		t.Fatalf("post-grant index missing list view: %q", body)
+	}
+	if strings.Contains(body, `id="apikey"`) {
+		t.Fatal("post-grant index still shows the grant form")
+	}
+}
+
+func TestIndexMainViewBranches(t *testing.T) {
+	s, _ := testServer(t)
+
+	// Anonymous: login only.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rr := httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rr, req)
+	if !strings.Contains(rr.Body.String(), "Log in with Kanidm") {
+		t.Fatalf("anonymous index missing login: %q", rr.Body.String())
+	}
+
+	// Logged in, nothing pending: enrolled list + enroll-new entry point,
+	// verify form present but hidden, no grant form.
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(loginAs(s, "sub-1", ""))
+	rr = httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rr, req)
+	body := rr.Body.String()
+	if !strings.Contains(body, "Enrolled phone numbers") || !strings.Contains(body, `id="enrollNew"`) {
+		t.Fatalf("list view missing enrolled list + enroll entry: %q", body)
+	}
+	if !strings.Contains(body, `id="verifyCard" hidden`) {
+		t.Fatalf("verify form not hidden behind enroll entry: %q", body)
+	}
+	if strings.Contains(body, `id="apikey"`) {
+		t.Fatalf("list view shows grant form: %q", body)
+	}
+
+	// Pending verification: grant form + a way back to a different number.
+	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(loginAs(s, "sub-1", "+15550109999"))
+	rr = httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rr, req)
+	body = rr.Body.String()
+	if !strings.Contains(body, `id="apikey"`) || !strings.Contains(body, `id="useDifferent"`) {
+		t.Fatalf("pending view missing grant form + different-number path: %q", body)
+	}
+	if !strings.Contains(body, "Enrolled phone numbers") {
+		t.Fatalf("pending view missing enrolled list: %q", body)
+	}
+}
+
 func TestRevokeCurrentNumberClearsSession(t *testing.T) {
 	s, _ := testServer(t)
 	seedEnrollmentWithPIN(t, s, "+15550109999", "sub-1", "k", "482916")
