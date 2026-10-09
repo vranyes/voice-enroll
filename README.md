@@ -10,13 +10,19 @@ Reference: `PLAN.md` in `~/personal/taskmaster` (auth + isolation sections).
 2. **Verify number** — `POST /api/otp/send {"phone"}` → Telnyx SMS 6-digit code
    (sha256 at rest, single-use, 10 min expiry, 5 guesses max, 5 sends/hour per
    number) → `POST /api/otp/verify {"phone","code"}`.
-3. **Grant access** — `POST /api/grant {"api_key"}` (login + verified number
-   required). Key verified live against LibreChat, AES-GCM-encrypted under the
-   sealed DEK, stored keyed by E.164 with the Kanidm `sub`.
+3. **Grant access** — `POST /api/grant {"api_key","pin"}` (login + verified
+   number required). Key verified live against LibreChat, AES-GCM-encrypted
+   under the sealed DEK, stored keyed by E.164 with the Kanidm `sub`. PIN is
+   4-12 DTMF digits, AES-GCM-encrypted under the same DEK, never logged.
 4. **Internal resolve** — `GET :8082/resolve?phone=<e164>` (ClusterIP only,
    no auth — relies on cluster networking). Returns `{user_sub}`;
    `?reveal=key` adds `{api_key}`. Unknown numbers deny identically
    to unenrolled ones.
+5. **Internal PIN verify** — `POST :8082/verify-pin {"phone","pin"}`
+   (ClusterIP only, same isolation). Returns `{user_sub}` on a match,
+   404 `{error:deny}` otherwise. Unknown numbers, missing PINs, malformed
+   input and wrong digits all deny identically — voice-bridge uses this to
+   identify the caller per-enrollment (no global code).
 
 Revocation: `POST /api/revoke` deletes the mapping; resolve reads PG live per
 request, so the next call denies. No caches in this service.
@@ -37,6 +43,7 @@ chainguard static base (see `.ko.yaml`) — there is no Dockerfile.
 
 - `phone.go` — E.164 normalization (voice-bridge slice-4 semantics)
 - `otp.go` — code lifecycle (hash/attempts/expiry/rate-limit)
+- `pin.go` — voice PIN validation (4-12 digits) + constant-time verify
 - `crypto.go` — AES-GCM DEK envelope
 - `store.go` / `pg.go` — directory (memory for tests, cnpg for deploy)
 - `verify.go` — live LibreChat key check + Telnyx SMS sender

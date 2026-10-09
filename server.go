@@ -64,6 +64,7 @@ func (s *Server) InternalMux() *http.ServeMux {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	m.HandleFunc("GET /resolve", s.handleResolve)
+	m.HandleFunc("POST /verify-pin", s.handleVerifyPIN)
 	return m
 }
 
@@ -248,6 +249,7 @@ func (s *Server) handleOTPVerify(w http.ResponseWriter, r *http.Request) {
 
 type grantReq struct {
 	APIKey string `json:"api_key"`
+	PIN    string `json:"pin"`
 }
 
 func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +268,11 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
+	pin := strings.TrimSpace(req.PIN)
+	if err := ValidatePIN(pin); err != nil {
+		http.Error(w, "invalid PIN: need 4-12 digits", http.StatusBadRequest)
+		return
+	}
 	if err := VerifyLibreChatKey(r.Context(), s.httpClient, s.libreChat, key); err != nil {
 		if err == ErrInvalidKey {
 			http.Error(w, "key rejected by LibreChat", http.StatusBadRequest)
@@ -279,9 +286,15 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	pinNonce, pinCT, err := s.keys.Encrypt([]byte(pin))
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	if err := s.store.UpsertEnrollment(r.Context(), Enrollment{
 		Phone: phoneOf(sess), UserSub: sess.Sub,
-		EncKey: ct, Nonce: nonce, VerifiedAt: s.now(),
+		EncKey: ct, Nonce: nonce, EncPIN: pinCT, PINNonce: pinNonce,
+		VerifiedAt: s.now(),
 	}); err != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
@@ -347,6 +360,48 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
+// handleVerifyPIN is the internal per-caller PIN check the voice path uses
+// at call time. POST /verify-pin {"phone","pin"} returns 200 {user_sub} on
+// a match, 404 {error:deny} otherwise. Unknown numbers, missing PINs,
+// malformed input and wrong digits all deny identically so probers cannot
+// distinguish them. No bearer auth: ClusterIP-only listener, same isolation
+// as /resolve. PIN plaintext never leaves this process in logs or captures.
+func (s *Server) handleVerifyPIN(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Phone string `json:"phone"`
+		PIN   string `json:"pin"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		deny(w)
+		return
+	}
+	phone, err := NormalizeE164(req.Phone)
+	if err != nil || ValidatePIN(strings.TrimSpace(req.PIN)) != nil {
+		deny(w)
+		return
+	}
+	e, err := s.store.GetByPhone(r.Context(), phone)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if e == nil || len(e.EncPIN) == 0 || len(e.PINNonce) == 0 {
+		deny(w)
+		return
+	}
+	plain, err := s.keys.Decrypt(e.PINNonce, e.EncPIN)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !VerifyPIN(string(plain), strings.TrimSpace(req.PIN)) {
+		deny(w)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"user_sub": e.UserSub})
+}
+
 func deny(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
@@ -400,9 +455,11 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		b.WriteString(`<div class="card"><h2>Step 2 — Number verified</h2><p><span class="pill">` +
 			html.EscapeString(sess.VerifiedPhone) + `</span></p></div>` +
 			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
-			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted.</p>` +
+			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
 			`<label for="apikey">LibreChat API key</label>` +
 			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
+			`<label for="pin">Voice PIN (4-12 digits)</label>` +
+			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
 			`<div class="row"><button id="grant">Grant access</button>` +
 			`<button id="revoke" class="secondary">Revoke access</button></div></div>` +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
@@ -421,7 +478,7 @@ if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',
 const verify=document.getElementById('verify');
 if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});say('Verified.','ok');location.reload();}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
-if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value});say('Voice access granted.','ok');}catch(e){say(e.message,'err');}};
+if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});say('Voice access granted.','ok');}catch(e){say(e.message,'err');}};
 const revoke=document.getElementById('revoke');
 if(revoke)revoke.onclick=async()=>{say('Revoking…');try{await post('/api/revoke',{});say('Access revoked.','ok');}catch(e){say(e.message,'err');}};
 </script></body></html>`)

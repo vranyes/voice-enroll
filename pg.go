@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS enrollments (
   verified_at TIMESTAMPTZ NOT NULL,
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_pin BYTEA;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS pin_nonce BYTEA;
 CREATE TABLE IF NOT EXISTS otp_codes (
   phone        TEXT PRIMARY KEY,
   code_hash    BYTEA NOT NULL,
@@ -82,19 +84,20 @@ ON CONFLICT (phone) DO UPDATE SET
 
 func (s *PGStore) UpsertEnrollment(ctx context.Context, e Enrollment) error {
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO enrollments (phone, user_sub, enc_key, nonce, verified_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,now())
+INSERT INTO enrollments (phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,now())
 ON CONFLICT (phone) DO UPDATE SET
   user_sub=EXCLUDED.user_sub, enc_key=EXCLUDED.enc_key, nonce=EXCLUDED.nonce,
+  enc_pin=EXCLUDED.enc_pin, pin_nonce=EXCLUDED.pin_nonce,
   verified_at=EXCLUDED.verified_at, updated_at=now()`,
-		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.VerifiedAt)
+		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.EncPIN, e.PINNonce, e.VerifiedAt)
 	return err
 }
 
 func (s *PGStore) GetByPhone(ctx context.Context, phone string) (*Enrollment, error) {
 	var e Enrollment
-	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, verified_at
-FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce, &e.VerifiedAt)
+	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at
+FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce, &e.EncPIN, &e.PINNonce, &e.VerifiedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}

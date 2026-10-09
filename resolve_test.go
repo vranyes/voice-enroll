@@ -28,12 +28,22 @@ func testServer(t *testing.T) (*Server, *memoryStore) {
 
 func seedEnrollment(t *testing.T, s *Server, phone, sub, key string) {
 	t.Helper()
+	seedEnrollmentWithPIN(t, s, phone, sub, key, "482916")
+}
+
+func seedEnrollmentWithPIN(t *testing.T, s *Server, phone, sub, key, pin string) {
+	t.Helper()
 	n, ct, err := s.keys.Encrypt([]byte(key))
 	if err != nil {
 		t.Fatal(err)
 	}
+	pn, pct, err := s.keys.Encrypt([]byte(pin))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.store.UpsertEnrollment(context.Background(), Enrollment{
-		Phone: phone, UserSub: sub, EncKey: ct, Nonce: n, VerifiedAt: time.Now(),
+		Phone: phone, UserSub: sub, EncKey: ct, Nonce: n,
+		EncPIN: pct, PINNonce: pn, VerifiedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -157,20 +167,20 @@ func TestGrantStoresLiveKeyRejectsDead(t *testing.T) {
 	s.libreChat = fake.URL
 	s.httpClient = fake.Client()
 
-	post := func(key, phone string) int {
-		req := httptest.NewRequest(http.MethodPost, "/api/grant", strings.NewReader(`{"api_key":`+quote(key)+`}`))
+	post := func(key, pin, phone string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/grant", strings.NewReader(`{"api_key":`+quote(key)+`,"pin":`+quote(pin)+`}`))
 		req.AddCookie(loginAs(s, "sub-1", phone))
 		rr := httptest.NewRecorder()
 		s.PublicMux().ServeHTTP(rr, req)
 		return rr.Code
 	}
-	if code := post("dead", "+15550109999"); code != http.StatusBadRequest {
+	if code := post("dead", "482916", "+15550109999"); code != http.StatusBadRequest {
 		t.Fatalf("dead key: status %d, want 400", code)
 	}
 	if e, _ := s.store.GetByPhone(context.Background(), "+15550109999"); e != nil {
 		t.Fatal("dead key was stored")
 	}
-	if code := post("good", "+15550109999"); code != http.StatusCreated {
+	if code := post("good", "482916", "+15550109999"); code != http.StatusCreated {
 		t.Fatalf("live key: status %d, want 201", code)
 	}
 	e, _ := s.store.GetByPhone(context.Background(), "+15550109999")
@@ -180,6 +190,10 @@ func TestGrantStoresLiveKeyRejectsDead(t *testing.T) {
 	plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
 	if err != nil || string(plain) != "good" {
 		t.Fatal("stored key does not decrypt to the granted key")
+	}
+	pinPlain, err := s.keys.Decrypt(e.PINNonce, e.EncPIN)
+	if err != nil || string(pinPlain) != "482916" {
+		t.Fatal("stored PIN does not decrypt to the granted PIN")
 	}
 }
 
@@ -237,4 +251,92 @@ func TestPublicMuxHasNoResolve(t *testing.T) {
 	}
 	body, _ := io.ReadAll(rr.Body)
 	_ = body
+}
+
+func TestGrantRejectsBadPIN(t *testing.T) {
+	s, _ := testServer(t)
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer fake.Close()
+	s.libreChat = fake.URL
+	s.httpClient = fake.Client()
+
+	post := func(pin string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/grant", strings.NewReader(`{"api_key":"good","pin":`+quote(pin)+`}`))
+		req.AddCookie(loginAs(s, "sub-1", "+15550109999"))
+		rr := httptest.NewRecorder()
+		s.PublicMux().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	for _, pin := range []string{"", "123", "1234567890123", "12a4", "  "} {
+		if code := post(pin); code != http.StatusBadRequest {
+			t.Fatalf("pin %q: status %d, want 400", pin, code)
+		}
+	}
+	if e, _ := s.store.GetByPhone(context.Background(), "+15550109999"); e != nil {
+		t.Fatal("bad PIN was stored")
+	}
+	// 4- and 12-digit boundaries store.
+	if code := post("1234"); code != http.StatusCreated {
+		t.Fatalf("4-digit PIN: status %d, want 201", code)
+	}
+	if code := post("123456789012"); code != http.StatusCreated {
+		t.Fatalf("12-digit PIN: status %d, want 201", code)
+	}
+}
+
+func postVerifyPIN(t *testing.T, s *Server, phone, pin string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/verify-pin", strings.NewReader(`{"phone":`+quote(phone)+`,"pin":`+quote(pin)+`}`))
+	rr := httptest.NewRecorder()
+	s.InternalMux().ServeHTTP(rr, req)
+	return rr
+}
+
+func TestVerifyPINAcceptsCorrectRejectsWrongIdentically(t *testing.T) {
+	s, _ := testServer(t)
+	seedEnrollmentWithPIN(t, s, "+15550109999", "kanidm-sub-1", "k", "482916")
+
+	rr := postVerifyPIN(t, s, "+15550109999", "482916")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("correct PIN: status %d, want 200", rr.Code)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil || out["user_sub"] != "kanidm-sub-1" {
+		t.Fatalf("correct PIN body: %q", rr.Body.String())
+	}
+
+	wrong := postVerifyPIN(t, s, "+15550109999", "000000")
+	unknown := postVerifyPIN(t, s, "+19998887777", "482916")
+	malformed := postVerifyPIN(t, s, "+15550109999", "12")
+	if wrong.Code != http.StatusNotFound || unknown.Code != http.StatusNotFound || malformed.Code != http.StatusNotFound {
+		t.Fatalf("statuses %d/%d/%d, want 404/404/404", wrong.Code, unknown.Code, malformed.Code)
+	}
+	if wrong.Body.String() != unknown.Body.String() || wrong.Body.String() != malformed.Body.String() {
+		t.Fatalf("distinguishable deny bodies: %q vs %q vs %q", wrong.Body.String(), unknown.Body.String(), malformed.Body.String())
+	}
+}
+
+func TestVerifyPINRequiresPINAtGrant(t *testing.T) {
+	s, _ := testServer(t)
+	// Legacy row without PIN material (pre-migration): verify denies.
+	n, ct, _ := s.keys.Encrypt([]byte("k"))
+	_ = s.store.UpsertEnrollment(context.Background(), Enrollment{
+		Phone: "+15550109999", UserSub: "sub-1", EncKey: ct, Nonce: n, VerifiedAt: time.Now(),
+	})
+	rr := postVerifyPIN(t, s, "+15550109999", "482916")
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("PIN-less row: status %d, want 404 deny", rr.Code)
+	}
+}
+
+func TestPublicMuxHasNoVerifyPIN(t *testing.T) {
+	s, _ := testServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/verify-pin", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	s.PublicMux().ServeHTTP(rr, req)
+	if rr.Code == http.StatusOK {
+		t.Fatal("public mux serves /verify-pin — PIN verifier must be internal-only")
+	}
 }
