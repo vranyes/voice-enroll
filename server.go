@@ -530,9 +530,9 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			verifyCard(true) +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	} else {
-		b.WriteString(`<div class="card"><h2>Step 2 — Number verified</h2><p><span class="pill">` +
-			html.EscapeString(sess.VerifiedPhone) + `</span></p></div>` +
+		b.WriteString(enrolledCard +
 			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
+			`<p><span class="pill">` + html.EscapeString(sess.VerifiedPhone) + `</span></p>` +
 			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
 			`<label for="apikey">LibreChat API key</label>` +
 			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
@@ -541,7 +541,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`<div class="row"><button id="grant">Grant access</button>` +
 			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>` +
 			verifyCard(true) +
-			enrolledCard +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
 	b.WriteString(`</main><script>

@@ -201,8 +201,13 @@ func TestIndexMainViewBranches(t *testing.T) {
 	if !strings.Contains(body, `id="apikey"`) || !strings.Contains(body, `id="useDifferent"`) {
 		t.Fatalf("pending view missing grant form + different-number path: %q", body)
 	}
-	if !strings.Contains(body, "Enrolled phone numbers") {
-		t.Fatalf("pending view missing enrolled list: %q", body)
+	if strings.Contains(body, "Step 2 — Number verified") {
+		t.Fatalf("pending view still has the top verified banner: %q", body)
+	}
+	listIdx := strings.Index(body, "Enrolled phone numbers")
+	grantIdx := strings.Index(body, "Grant voice access")
+	if listIdx < 0 || grantIdx < 0 || listIdx > grantIdx {
+		t.Fatalf("pending view not list-first: %q", body)
 	}
 }
 
