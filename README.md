@@ -40,7 +40,7 @@ chainguard static base (see `.ko.yaml`) — there is no Dockerfile.
 - `crypto.go` — AES-GCM DEK envelope
 - `store.go` / `pg.go` — directory (memory for tests, cnpg for deploy)
 - `verify.go` — live LibreChat key check + Telnyx SMS sender
-- `oidc.go` — stdlib Kanidm OIDC (JWKS-verified RS256) + signed sessions
+- `oidc.go` — stdlib Kanidm OIDC (JWKS-verified RS256/ES256) + signed sessions
 - `server.go` — public UI/API mux + internal resolve mux
 - `config.go` — env config, fail-closed on missing secrets
 - `cmd/voice-enroll` — dual-listener main

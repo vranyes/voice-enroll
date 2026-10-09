@@ -2,6 +2,8 @@ package enroll
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -15,11 +17,12 @@ import (
 	"time"
 )
 
-// fakeProvider builds an OIDC provider double with a generated RSA key.
+// fakeProvider builds an OIDC provider double with generated RSA + ECDSA keys.
 type fakeProvider struct {
 	t    *testing.T
 	srv  *httptest.Server
 	priv *rsa.PrivateKey
+	ec   *ecdsa.PrivateKey
 	iss  string
 }
 
@@ -29,7 +32,11 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeProvider{t: t, priv: priv}
+	ec, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeProvider{t: t, priv: priv, ec: ec}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{
@@ -42,8 +49,11 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, r *http.Request) {
 		n := base64.RawURLEncoding.EncodeToString(f.priv.N.Bytes())
 		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(f.priv.E)).Bytes())
+		x := base64.RawURLEncoding.EncodeToString(f.ec.X.Bytes())
+		y := base64.RawURLEncoding.EncodeToString(f.ec.Y.Bytes())
 		json.NewEncoder(w).Encode(map[string]any{"keys": []any{
 			map[string]string{"kid": "k1", "kty": "RSA", "n": n, "e": e},
+			map[string]string{"kid": "k2", "kty": "EC", "crv": "P-256", "x": x, "y": y},
 		}})
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
@@ -76,6 +86,29 @@ func (f *fakeProvider) mint(sub, aud, nonce string, exp time.Time) string {
 		f.t.Fatal(err)
 	}
 	return header + "." + p + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// mintES256 signs an id_token with ECDSA P-256 (JWS raw R||S signature),
+// matching what Kanidm issues in production.
+func (f *fakeProvider) mintES256(sub, aud, nonce string, exp time.Time) string {
+	f.t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256","kid":"k2","typ":"JWT"}`))
+	payload, _ := json.Marshal(map[string]any{
+		"iss": f.iss, "sub": sub, "aud": aud,
+		"exp": exp.Unix(), "iat": time.Now().Unix(), "nonce": nonce,
+	})
+	p := base64.RawURLEncoding.EncodeToString(payload)
+	h := sha256.Sum256([]byte(header + "." + p))
+	r, s, err := ecdsa.Sign(rand.Reader, f.ec, h[:])
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	rb := r.Bytes()
+	sb := s.Bytes()
+	raw := make([]byte, 64)
+	copy(raw[32-len(rb):32], rb)
+	copy(raw[64-len(sb):64], sb)
+	return header + "." + p + "." + base64.RawURLEncoding.EncodeToString(raw)
 }
 
 func TestOIDCLoginURL(t *testing.T) {
@@ -134,6 +167,34 @@ func TestOIDCExchangeRequiresVerifier(t *testing.T) {
 	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", ClientSecret: "s", RedirectURL: "https://enroll/x/cb", HTTPClient: f.srv.Client()}
 	if _, _, err := c.Exchange(t.Context(), "code", "test-nonce", ""); err == nil {
 		t.Fatal("missing verifier accepted")
+	}
+}
+
+func TestOIDCES256Verifies(t *testing.T) {
+	f := newFakeProvider(t)
+	defer f.srv.Close()
+	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", HTTPClient: f.srv.Client()}
+	d, _ := c.discover(t.Context())
+	tok := f.mintES256("es-sub", "test-client", "test-nonce", time.Now().Add(time.Hour))
+	sub, err := c.verifyIDToken(t.Context(), d, tok, "test-nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sub != "es-sub" {
+		t.Fatalf("sub = %q, want es-sub", sub)
+	}
+}
+
+func TestOIDCES256RejectsTampered(t *testing.T) {
+	f := newFakeProvider(t)
+	defer f.srv.Close()
+	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", HTTPClient: f.srv.Client()}
+	d, _ := c.discover(t.Context())
+	tok := f.mintES256("es-sub", "test-client", "test-nonce", time.Now().Add(time.Hour))
+	parts := strings.Split(tok, ".")
+	tampered := parts[0] + "." + parts[1] + ".AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if _, err := c.verifyIDToken(t.Context(), d, tampered, "test-nonce"); err == nil {
+		t.Fatal("tampered ES256 signature accepted")
 	}
 }
 

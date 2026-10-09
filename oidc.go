@@ -3,6 +3,8 @@ package enroll
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -155,7 +157,8 @@ func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce, verifier stri
 	return sub, tok.AccessToken, nil
 }
 
-// verifyIDToken checks signature (RS256 via JWKS), iss, aud, exp and nonce.
+// verifyIDToken checks signature (RS256 or ES256 via JWKS), iss, aud, exp
+// and nonce.
 func (c OIDCConfig) verifyIDToken(ctx context.Context, d *discoveryDoc, raw, wantNonce string) (string, error) {
 	parts := strings.Split(raw, ".")
 	if len(parts) != 3 {
@@ -169,7 +172,7 @@ func (c OIDCConfig) verifyIDToken(ctx context.Context, d *discoveryDoc, raw, wan
 	if err != nil || json.Unmarshal(hd, &header) != nil {
 		return "", errors.New("oidc: bad id_token header")
 	}
-	if header.Alg != "RS256" {
+	if header.Alg != "RS256" && header.Alg != "ES256" {
 		return "", fmt.Errorf("oidc: unexpected alg %q", header.Alg)
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -202,7 +205,7 @@ func (c OIDCConfig) verifyIDToken(ctx context.Context, d *discoveryDoc, raw, wan
 	if claims.Sub == "" {
 		return "", errors.New("oidc: empty sub")
 	}
-	pub, err := c.fetchKey(ctx, d.JWKSURI, header.Kid)
+	key, err := c.fetchKey(ctx, d.JWKSURI, header.Kid)
 	if err != nil {
 		return "", err
 	}
@@ -211,8 +214,29 @@ func (c OIDCConfig) verifyIDToken(ctx context.Context, d *discoveryDoc, raw, wan
 		return "", errors.New("oidc: bad signature")
 	}
 	h := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, h[:], sig); err != nil {
-		return "", errors.New("oidc: invalid signature")
+	switch header.Alg {
+	case "RS256":
+		pub, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return "", errors.New("oidc: key mismatch for RS256")
+		}
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, h[:], sig); err != nil {
+			return "", errors.New("oidc: invalid signature")
+		}
+	case "ES256":
+		pub, ok := key.(*ecdsa.PublicKey)
+		if !ok {
+			return "", errors.New("oidc: key mismatch for ES256")
+		}
+		// JWS ES256 signatures are raw R||S (64 bytes), not ASN.1 DER.
+		if len(sig) != 64 {
+			return "", errors.New("oidc: bad ES256 signature length")
+		}
+		r := new(big.Int).SetBytes(sig[:32])
+		s := new(big.Int).SetBytes(sig[32:])
+		if !ecdsa.Verify(pub, h[:], r, s) {
+			return "", errors.New("oidc: invalid signature")
+		}
 	}
 	return claims.Sub, nil
 }
@@ -235,12 +259,17 @@ type jwksDoc struct {
 	Keys []struct {
 		Kid string `json:"kid"`
 		Kty string `json:"kty"`
-		N   string `json:"n"`
-		E   string `json:"e"`
+		// RSA members.
+		N string `json:"n"`
+		E string `json:"e"`
+		// EC members (P-256 for ES256).
+		Crv string `json:"crv"`
+		X   string `json:"x"`
+		Y   string `json:"y"`
 	} `json:"keys"`
 }
 
-func (c OIDCConfig) fetchKey(ctx context.Context, jwksURI, kid string) (*rsa.PublicKey, error) {
+func (c OIDCConfig) fetchKey(ctx context.Context, jwksURI, kid string) (any, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, jwksURI, nil)
 	if err != nil {
 		return nil, err
@@ -255,22 +284,42 @@ func (c OIDCConfig) fetchKey(ctx context.Context, jwksURI, kid string) (*rsa.Pub
 		return nil, err
 	}
 	for _, k := range doc.Keys {
-		if k.Kid != kid || k.Kty != "RSA" {
+		if k.Kid != kid {
 			continue
 		}
-		nb, err := base64.RawURLEncoding.DecodeString(k.N)
-		if err != nil {
-			return nil, err
+		switch k.Kty {
+		case "RSA":
+			nb, err := base64.RawURLEncoding.DecodeString(k.N)
+			if err != nil {
+				return nil, err
+			}
+			eb, err := base64.RawURLEncoding.DecodeString(k.E)
+			if err != nil {
+				return nil, err
+			}
+			e := 0
+			for _, b := range eb {
+				e = e<<8 + int(b)
+			}
+			return &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}, nil
+		case "EC":
+			if k.Crv != "P-256" {
+				continue
+			}
+			xb, err := base64.RawURLEncoding.DecodeString(k.X)
+			if err != nil {
+				return nil, err
+			}
+			yb, err := base64.RawURLEncoding.DecodeString(k.Y)
+			if err != nil {
+				return nil, err
+			}
+			return &ecdsa.PublicKey{
+				Curve: elliptic.P256(),
+				X:     new(big.Int).SetBytes(xb),
+				Y:     new(big.Int).SetBytes(yb),
+			}, nil
 		}
-		eb, err := base64.RawURLEncoding.DecodeString(k.E)
-		if err != nil {
-			return nil, err
-		}
-		e := 0
-		for _, b := range eb {
-			e = e<<8 + int(b)
-		}
-		return &rsa.PublicKey{N: new(big.Int).SetBytes(nb), E: e}, nil
 	}
 	return nil, errors.New("oidc: signing key not found")
 }
