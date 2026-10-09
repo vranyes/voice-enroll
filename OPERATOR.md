@@ -12,8 +12,6 @@ stored AES-GCM-encrypted in Postgres).
 | `DATABASE_URL` | SealedSecret `voice-enroll-secrets` | `postgresql://enroll:<pw>@voice-enroll-pg-rw.voice-enroll.svc:5432/voiceenroll?sslmode=verify-ca&sslrootcert=/run/secrets/pg-ca.crt`, pw = the sealed pg password |
 | `ENROLL_DEK_B64` | same | `head -c32 /dev/urandom \| base64` (32-byte AES-GCM DEK; rotate = re-enroll all users) |
 | `ENROLL_SESSION_SECRET_B64` | same | `head -c32 /dev/urandom \| base64` (HMAC key for login cookies) |
-| `RESOLVE_EDGE_SECRET` | same | random; shared with **voice-bridge** (seal into its namespace too). Gets `{user_sub}` only. |
-| `RESOLVE_TASKMASTER_SECRET` | same | random, different from edge; shared with **taskmaster**. Only identity that receives key material. |
 | `KANIDM_CLIENT_SECRET` | same | created by kaniop for `KanidmOAuth2Client/voice-enroll-app` — read the generated Secret after apply, seal it here |
 | `TELNYX_API_KEY` | same | Telnyx portal → API keys (programmable SMS must be enabled on the account) |
 | `TELNYX_SENDER_NUMBER` | same | E.164 DID from the Telnyx account used as the OTP sender |
@@ -28,7 +26,6 @@ both `sealedsecret-*.yaml` to `kustomization.yaml` resources.
 2. Wait for kaniop to reconcile `voice-enroll-app`; confirm the client exists in Kanidm.
 3. Seal + apply both SealedSecrets; add to kustomization; re-apply.
 4. Add Flux entry (`deploy/apps/voice-enroll.yaml` in gitops) + image policy note below.
-5. Distribute `RESOLVE_EDGE_SECRET` to voice-bridge and `RESOLVE_TASKMASTER_SECRET` to taskmaster via their own SealedSecrets.
 
 ## Image publishing
 

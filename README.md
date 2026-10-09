@@ -14,8 +14,8 @@ Reference: `PLAN.md` in `~/personal/taskmaster` (auth + isolation sections).
    required). Key verified live against LibreChat, AES-GCM-encrypted under the
    sealed DEK, stored keyed by E.164 with the Kanidm `sub`.
 4. **Internal resolve** — `GET :8082/resolve?phone=<e164>` (ClusterIP only,
-   dual shared secrets). Edge gets `{user_sub}`; taskmaster adds
-   `?reveal=key` for `{user_sub, api_key}`. Unknown numbers deny identically
+   no auth — relies on cluster networking). Returns `{user_sub}`;
+   `?reveal=key` adds `{api_key}`. Unknown numbers deny identically
    to unenrolled ones.
 
 Revocation: `POST /api/revoke` deletes the mapping; resolve reads PG live per

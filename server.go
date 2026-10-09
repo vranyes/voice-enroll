@@ -26,20 +26,15 @@ type Server struct {
 	httpClient *http.Client
 	now        func() time.Time
 	sessionTTL time.Duration
-
-	edgeSecret       string
-	taskmasterSecret string
 }
 
-func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, sms SMSSender, smsFrom, libreChat string, edgeSecret, taskmasterSecret string) *Server {
+func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, sms SMSSender, smsFrom, libreChat string) *Server {
 	return &Server{
 		store: store, oidc: oidc, sessions: sessions, keys: keys,
 		sms: sms, smsFrom: smsFrom, libreChat: libreChat,
-		httpClient:       &http.Client{Timeout: 10 * time.Second},
-		now:              time.Now,
-		sessionTTL:       12 * time.Hour,
-		edgeSecret:       edgeSecret,
-		taskmasterSecret: taskmasterSecret,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		now:        time.Now,
+		sessionTTL: 12 * time.Hour,
 	}
 }
 
@@ -308,18 +303,10 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // return 404 with an identical body, so callers (and probers) cannot
 // distinguish them.
 //
-// Authorization is least-privilege by identity:
-//   - edge (voice-bridge) bearer  -> {user_sub} only. ?reveal=key is ignored.
-//   - taskmaster bearer            -> {user_sub}, plus ?reveal=key -> {user_sub, api_key}.
-//
-// Key material is served ONLY to the taskmaster identity, never to the edge.
-// Tested explicitly in resolve_test.go.
+// No bearer auth: the listener is ClusterIP-only (no HTTPRoute) and relies
+// on cluster networking for isolation. Any in-cluster caller can resolve;
+// ?reveal=key returns key material.
 func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
-	role := s.resolveRole(r)
-	if role == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		return
-	}
 	phone, err := NormalizeE164(r.URL.Query().Get("phone"))
 	if err != nil {
 		deny(w)
@@ -335,7 +322,7 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]string{"user_sub": e.UserSub}
-	if role == "taskmaster" && r.URL.Query().Get("reveal") == "key" {
+	if r.URL.Query().Get("reveal") == "key" {
 		plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
 		if err != nil {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
@@ -351,22 +338,6 @@ func deny(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusNotFound)
 	json.NewEncoder(w).Encode(map[string]string{"error": "deny"})
-}
-
-func (s *Server) resolveRole(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	const p = "Bearer "
-	if !strings.HasPrefix(auth, p) {
-		return ""
-	}
-	got := strings.TrimPrefix(auth, p)
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.taskmasterSecret)) == 1 {
-		return "taskmaster"
-	}
-	if subtle.ConstantTimeCompare([]byte(got), []byte(s.edgeSecret)) == 1 {
-		return "edge"
-	}
-	return ""
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {

@@ -22,8 +22,7 @@ func testServer(t *testing.T) (*Server, *memoryStore) {
 	codec, _ := NewSessionCodec([]byte(strings.Repeat("s", 32)))
 	st := NewMemoryStore()
 	s := NewServer(st, OIDCConfig{}, codec, k,
-		&TelnyxSender{}, "+15550001111", "https://librechat.vranyes.com",
-		"edge-secret", "taskmaster-secret")
+		&TelnyxSender{}, "+15550001111", "https://librechat.vranyes.com")
 	return s, st.(*memoryStore)
 }
 
@@ -40,76 +39,54 @@ func seedEnrollment(t *testing.T, s *Server, phone, sub, key string) {
 	}
 }
 
-func getResolve(t *testing.T, s *Server, phone, bearer, reveal string) *httptest.ResponseRecorder {
+func getResolve(t *testing.T, s *Server, phone, reveal string) *httptest.ResponseRecorder {
 	t.Helper()
 	target := "/resolve?phone=" + phone
 	if reveal != "" {
 		target += "&reveal=" + reveal
 	}
 	req := httptest.NewRequest(http.MethodGet, target, nil)
-	if bearer != "" {
-		req.Header.Set("Authorization", "Bearer "+bearer)
-	}
 	rr := httptest.NewRecorder()
 	s.InternalMux().ServeHTTP(rr, req)
 	return rr
 }
 
-func TestResolveEdgeGetsUserSubOnly(t *testing.T) {
+func TestResolveGetsUserSubOnly(t *testing.T) {
 	s, _ := testServer(t)
 	seedEnrollment(t, s, "+15550109999", "kanidm-sub-1", "live-librechat-key")
 
-	rr := getResolve(t, s, "+15550109999", "edge-secret", "")
+	rr := getResolve(t, s, "+15550109999", "")
 	if rr.Code != http.StatusOK {
-		t.Fatalf("edge resolve: status %d", rr.Code)
+		t.Fatalf("resolve: status %d", rr.Code)
 	}
 	var out map[string]string
 	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
 		t.Fatal(err)
 	}
 	if out["user_sub"] != "kanidm-sub-1" {
-		t.Fatalf("edge resolve: %v", out)
+		t.Fatalf("resolve: %v", out)
 	}
 	if _, hasKey := out["api_key"]; hasKey {
-		t.Fatal("edge resolve leaked key material")
+		t.Fatal("resolve leaked key material without reveal=key")
 	}
 }
 
-// TestResolveEdgeNeverGetsKeyMaterial is the explicit least-privilege test:
-// even when the edge asks for ?reveal=key, it must not receive it.
-func TestResolveEdgeNeverGetsKeyMaterial(t *testing.T) {
+func TestResolveGetsKeyOnReveal(t *testing.T) {
 	s, _ := testServer(t)
 	seedEnrollment(t, s, "+15550109999", "kanidm-sub-1", "live-librechat-key")
 
-	rr := getResolve(t, s, "+15550109999", "edge-secret", "key")
-	var out map[string]string
-	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
-		t.Fatal(err)
-	}
-	if _, hasKey := out["api_key"]; hasKey {
-		t.Fatal("EDGE RECEIVED KEY MATERIAL — isolation boundary violated")
-	}
-	if out["user_sub"] != "kanidm-sub-1" {
-		t.Fatalf("edge resolve: %v", out)
-	}
-}
-
-func TestResolveTaskmasterGetsKeyOnReveal(t *testing.T) {
-	s, _ := testServer(t)
-	seedEnrollment(t, s, "+15550109999", "kanidm-sub-1", "live-librechat-key")
-
-	rr := getResolve(t, s, "+15550109999", "taskmaster-secret", "")
+	rr := getResolve(t, s, "+15550109999", "")
 	var out map[string]string
 	json.NewDecoder(rr.Body).Decode(&out)
 	if _, hasKey := out["api_key"]; hasKey {
-		t.Fatal("taskmaster got key material without reveal=key")
+		t.Fatal("got key material without reveal=key")
 	}
 
-	rr = getResolve(t, s, "+15550109999", "taskmaster-secret", "key")
+	rr = getResolve(t, s, "+15550109999", "key")
 	out = map[string]string{}
 	json.NewDecoder(rr.Body).Decode(&out)
 	if out["api_key"] != "live-librechat-key" || out["user_sub"] != "kanidm-sub-1" {
-		t.Fatalf("taskmaster reveal: %v", out)
+		t.Fatalf("reveal: %v", out)
 	}
 }
 
@@ -121,8 +98,8 @@ func TestResolveUnknownAndUnenrolledIdentical(t *testing.T) {
 	if _, err := s.store.DeleteEnrollment(context.Background(), "+15550109999", "kanidm-sub-1"); err != nil {
 		t.Fatal(err)
 	}
-	a := getResolve(t, s, "+19998887777", "edge-secret", "")
-	b := getResolve(t, s, "+15550109999", "edge-secret", "")
+	a := getResolve(t, s, "+19998887777", "")
+	b := getResolve(t, s, "+15550109999", "")
 	if a.Code != http.StatusNotFound || b.Code != http.StatusNotFound {
 		t.Fatalf("statuses %d/%d, want 404/404", a.Code, b.Code)
 	}
@@ -131,29 +108,10 @@ func TestResolveUnknownAndUnenrolledIdentical(t *testing.T) {
 	}
 }
 
-func TestResolveAuth(t *testing.T) {
-	s, _ := testServer(t)
-	seedEnrollment(t, s, "+15550109999", "kanidm-sub-1", "k")
-	// No header at all.
-	req := httptest.NewRequest(http.MethodGet, "/resolve?phone=+15550109999", nil)
-	rr := httptest.NewRecorder()
-	s.InternalMux().ServeHTTP(rr, req)
-	if rr.Code != http.StatusUnauthorized {
-		t.Fatalf("no auth: status %d, want 401", rr.Code)
-	}
-	// Wrong secret and mangled secret both deny.
-	for _, bearer := range []string{"wrong-secret", "edge-secret ", "Edge-Secret"} {
-		rr := getResolve(t, s, "+15550109999", bearer, "")
-		if rr.Code != http.StatusUnauthorized {
-			t.Fatalf("bearer %q: status %d, want 401", bearer, rr.Code)
-		}
-	}
-}
-
 func TestResolveNormalizesPhone(t *testing.T) {
 	s, _ := testServer(t)
 	seedEnrollment(t, s, "+15550109999", "kanidm-sub-1", "k")
-	rr := getResolve(t, s, "+1+(555)+010-9999", "edge-secret", "")
+	rr := getResolve(t, s, "+1+(555)+010-9999", "")
 	if rr.Code != http.StatusOK {
 		t.Fatalf("unnormalized caller id denied: %d", rr.Code)
 	}
@@ -242,7 +200,7 @@ func TestRevokeDeletesMappingAndResolveDenies(t *testing.T) {
 		t.Fatalf("revoke: status %d", rr.Code)
 	}
 	// Fail-closed by construction: the next resolve denies.
-	rr = getResolve(t, s, "+15550109999", "edge-secret", "")
+	rr = getResolve(t, s, "+15550109999", "")
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("post-revoke resolve: status %d, want 404 deny", rr.Code)
 	}
@@ -272,7 +230,6 @@ func TestRevokeCannotDeleteOthersNumber(t *testing.T) {
 func TestPublicMuxHasNoResolve(t *testing.T) {
 	s, _ := testServer(t)
 	req := httptest.NewRequest(http.MethodGet, "/resolve?phone=+15550109999", nil)
-	req.Header.Set("Authorization", "Bearer taskmaster-secret")
 	rr := httptest.NewRecorder()
 	s.PublicMux().ServeHTTP(rr, req)
 	if rr.Code == http.StatusOK {

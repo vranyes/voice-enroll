@@ -19,9 +19,6 @@ type Config struct {
 	DEK           []byte // 32-byte base64 AES-GCM key for LibreChat keys
 	SessionSecret []byte // >=32-byte base64 HMAC key for login cookies
 
-	EdgeSecret       string // bearer for phone->user resolve (voice-bridge)
-	TaskmasterSecret string // bearer for phone->key resolve (taskmaster only)
-
 	OIDC          OIDCConfig
 	TelnyxKey     string
 	TelnyxSender  string // E.164 sender number for OTP SMS
@@ -49,8 +46,6 @@ func LoadConfig() (Config, error) {
 	c.LibreChatBase = getenv("LIBRECHAT_BASE_URL")
 	c.TelnyxKey = getenv("TELNYX_API_KEY")
 	c.TelnyxSender = getenv("TELNYX_SENDER_NUMBER")
-	c.EdgeSecret = getenv("RESOLVE_EDGE_SECRET")
-	c.TaskmasterSecret = getenv("RESOLVE_TASKMASTER_SECRET")
 
 	dek, err := base64.StdEncoding.DecodeString(getenv("ENROLL_DEK_B64"))
 	if err != nil || len(dek) != 32 {
@@ -77,12 +72,6 @@ func LoadConfig() (Config, error) {
 	}
 	if c.TelnyxKey == "" || c.TelnyxSender == "" {
 		return c, errors.New("TELNYX_API_KEY/TELNYX_SENDER_NUMBER required")
-	}
-	if c.EdgeSecret == "" || c.TaskmasterSecret == "" {
-		return c, errors.New("RESOLVE_EDGE_SECRET/RESOLVE_TASKMASTER_SECRET required")
-	}
-	if c.EdgeSecret == c.TaskmasterSecret {
-		return c, errors.New("edge and taskmaster resolve secrets must differ")
 	}
 	c.SessionTTL = 12 * time.Hour
 	return c, nil
