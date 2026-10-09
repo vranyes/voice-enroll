@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"html"
 	"log"
 	"net/http"
 	"strings"
@@ -360,23 +361,68 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	sess, loggedIn := s.currentSession(r)
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html><body><h1>Voice enrollment</h1>`)
+	b.WriteString(`<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+		`<meta name="viewport" content="width=device-width,initial-scale=1">` +
+		`<title>Voice enrollment</title><style>` +
+		`body{font-family:system-ui,-apple-system,sans-serif;background:#f6f6f4;color:#1a1a1a;margin:0}` +
+		`main{max-width:560px;margin:48px auto;padding:0 16px}` +
+		`.card{background:#fff;border:1px solid #e2e2e0;border-radius:12px;padding:20px;margin:16px 0}` +
+		`h1{font-size:24px;margin:0 0 4px}h2{font-size:16px;margin:20px 0 4px}` +
+		`.sub{color:#666;font-size:14px;margin:0}` +
+		`label{display:block;font-size:13px;color:#555;margin:12px 0 4px}` +
+		`input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #ccc;border-radius:8px;font-size:16px}` +
+		`button{padding:10px 16px;border:0;border-radius:8px;font-size:15px;background:#1a1a1a;color:#fff;cursor:pointer}` +
+		`button.secondary{background:#e8e8e6;color:#1a1a1a}` +
+		`.row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap}` +
+		`#status{min-height:1.4em;font-size:14px;color:#555;margin:12px 0 0}` +
+		`#status.ok{color:#0a7d2c}#status.err{color:#b00020}` +
+		`.pill{display:inline-block;font-size:13px;background:#eef7ee;color:#0a7d2c;border-radius:999px;padding:2px 10px}` +
+		`a.btn{display:inline-block;padding:10px 16px;border-radius:8px;background:#1a1a1a;color:#fff;text-decoration:none}` +
+		`</style></head><body><main><h1>Voice enrollment</h1>` +
+		`<p class="sub">Verify a number, then grant it voice access.</p>` +
+		`<p id="status" role="status"></p>`)
 	if !loggedIn {
-		b.WriteString(`<p><a href="/login">Log in with Kanidm</a></p>`)
+		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
+			`<p class="sub">Kanidm confirms who you are.</p>` +
+			`<div class="row"><a class="btn" href="/login">Log in with Kanidm</a></div></div>`)
+	} else if sess.VerifiedPhone == "" {
+		b.WriteString(`<div class="card"><h2>Step 2 — Verify your number</h2>` +
+			`<label for="phone">Phone number</label>` +
+			`<input id="phone" type="tel" inputmode="tel" autocomplete="tel" placeholder="+15550109999">` +
+			`<div class="row"><button id="send">Send code</button></div>` +
+			`<label for="code">6-digit code from SMS</label>` +
+			`<input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6">` +
+			`<div class="row"><button id="verify">Verify</button></div></div>` +
+			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	} else {
-		b.WriteString(`<p>Logged in.</p>`)
-		if sess.VerifiedPhone == "" {
-			b.WriteString(`<h2>Verify your number</h2>
-<p>Use the JSON API: POST /api/otp/send {"phone":"+..."}, then POST /api/otp/verify {"phone":"+...","code":"123456"}.</p>`)
-		} else {
-			b.WriteString(`<p>Verified number on file.</p>
-<h2>Grant voice access</h2>
-<p>Paste your LibreChat Remote Agents API key: POST /api/grant {"api_key":"..."} — verified live, stored encrypted.</p>
-<form method="post" action="/api/revoke"><button>Revoke access</button></form>`)
-		}
-		b.WriteString(`<form method="post" action="/logout"><button>Log out</button></form>`)
+		b.WriteString(`<div class="card"><h2>Step 2 — Number verified</h2><p><span class="pill">` +
+			html.EscapeString(sess.VerifiedPhone) + `</span></p></div>` +
+			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
+			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted.</p>` +
+			`<label for="apikey">LibreChat API key</label>` +
+			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
+			`<div class="row"><button id="grant">Grant access</button>` +
+			`<button id="revoke" class="secondary">Revoke access</button></div></div>` +
+			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
-	b.WriteString(`</body></html>`)
+	b.WriteString(`</main><script>
+const status=document.getElementById('status');
+function say(msg,cls){if(!status)return;status.textContent=msg;status.className=cls||'';}
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok){let t='';try{t=await r.text();}catch(e){}throw new Error(t||('request failed: '+r.status));}
+  return r;
+}
+function phoneVal(){const el=document.getElementById('phone');return el?el.value:'';}
+const send=document.getElementById('send');
+if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',{phone:phoneVal()});say('Code sent — check SMS.','ok');}catch(e){say(e.message,'err');}};
+const verify=document.getElementById('verify');
+if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});say('Verified.','ok');location.reload();}catch(e){say(e.message,'err');}};
+const grant=document.getElementById('grant');
+if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value});say('Voice access granted.','ok');}catch(e){say(e.message,'err');}};
+const revoke=document.getElementById('revoke');
+if(revoke)revoke.onclick=async()=>{say('Revoking…');try{await post('/api/revoke',{});say('Access revoked.','ok');}catch(e){say(e.message,'err');}};
+</script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
 }
