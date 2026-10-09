@@ -150,17 +150,20 @@ func TestGrantClearsPendingVerification(t *testing.T) {
 		t.Fatal("grant did not refresh the session cookie")
 	}
 	// Back to the clean main view: enrolled list + enroll-new entry point,
-	// no pending grant form for the just-enrolled number.
+	// grant form hidden again for the just-enrolled number.
 	req = httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(granted)
 	rrec := httptest.NewRecorder()
 	s.PublicMux().ServeHTTP(rrec, req)
 	body := rrec.Body.String()
-	if !strings.Contains(body, "Enrolled phone numbers") || !strings.Contains(body, "Enroll new phone number") {
+	if !strings.Contains(body, "Enrolled phone numbers") || !strings.Contains(body, `id="enrollNew"`) {
 		t.Fatalf("post-grant index missing list view: %q", body)
 	}
-	if strings.Contains(body, `id="apikey"`) {
-		t.Fatal("post-grant index still shows the grant form")
+	if !strings.Contains(body, `id="grantCard" hidden`) {
+		t.Fatalf("post-grant index shows the grant form: %q", body)
+	}
+	if !strings.Contains(body, `window.__verifiedPhone=""`) {
+		t.Fatalf("post-grant index carries pending state: %q", body)
 	}
 }
 
@@ -175,8 +178,8 @@ func TestIndexMainViewBranches(t *testing.T) {
 		t.Fatalf("anonymous index missing login: %q", rr.Body.String())
 	}
 
-	// Logged in, nothing pending: enrolled list + enroll-new entry point,
-	// verify form present but hidden, no grant form.
+	// Logged in, nothing pending: enrolled list + enroll-new entry point;
+	// verify and grant forms both hidden.
 	req = httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(loginAs(s, "sub-1", ""))
 	rr = httptest.NewRecorder()
@@ -185,24 +188,36 @@ func TestIndexMainViewBranches(t *testing.T) {
 	if !strings.Contains(body, "Enrolled phone numbers") || !strings.Contains(body, `id="enrollNew"`) {
 		t.Fatalf("list view missing enrolled list + enroll entry: %q", body)
 	}
-	if !strings.Contains(body, `id="verifyCard" hidden`) {
-		t.Fatalf("verify form not hidden behind enroll entry: %q", body)
-	}
-	if strings.Contains(body, `id="apikey"`) {
-		t.Fatalf("list view shows grant form: %q", body)
+	for _, hidden := range []string{`id="verifyCard" hidden`, `id="grantCard" hidden`, `window.__verifiedPhone=""`} {
+		if !strings.Contains(body, hidden) {
+			t.Fatalf("list view missing %q: %q", hidden, body)
+		}
 	}
 
-	// Pending verification: grant form + a way back to a different number.
+	// Pending verification (e.g. reloaded after verifying): same list-first
+	// view, but the enroll entry steps aside for the visible grant form
+	// carrying the verified number.
 	req = httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(loginAs(s, "sub-1", "+15550109999"))
 	rr = httptest.NewRecorder()
 	s.PublicMux().ServeHTTP(rr, req)
 	body = rr.Body.String()
-	if !strings.Contains(body, `id="apikey"`) || !strings.Contains(body, `id="useDifferent"`) {
-		t.Fatalf("pending view missing grant form + different-number path: %q", body)
+	if !strings.Contains(body, `id="useDifferent"`) || !strings.Contains(body, `window.__verifiedPhone="+15550109999"`) {
+		t.Fatalf("pending view missing pending state: %q", body)
 	}
 	if strings.Contains(body, "Step 2 — Number verified") {
 		t.Fatalf("pending view still has the top verified banner: %q", body)
+	}
+	for _, want := range []string{`id="enrollCard" hidden`, `id="verifyCard" hidden`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("pending view missing %q: %q", want, body)
+		}
+	}
+	if strings.Contains(body, `id="grantCard" hidden`) {
+		t.Fatalf("pending view hides the grant form: %q", body)
+	}
+	if !strings.Contains(body, "+15550109999") {
+		t.Fatalf("pending view missing verified number: %q", body)
 	}
 	listIdx := strings.Index(body, "Enrolled phone numbers")
 	grantIdx := strings.Index(body, "Grant voice access")

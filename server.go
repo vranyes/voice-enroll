@@ -518,21 +518,29 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`<input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" maxlength="6">` +
 			`<div class="row"><button id="verify">Verify</button></div></div>`
 	}
+	// Logged-in main view is always the enrolled list plus the enroll entry
+	// point. Verify and grant are progressive disclosure: hidden until the
+	// user starts enrolling (or resumes a pending verification after a
+	// reload — window.__verifiedPhone carries that state).
+	// sess.VerifiedPhone is E.164 ("+" + digits) by construction, so it is
+	// safe to embed in a quoted JS string.
 	if !loggedIn {
 		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
 			`<p class="sub">Kanidm confirms who you are.</p>` +
 			`<div class="row"><a class="btn" href="/login">Log in with Kanidm</a></div></div>`)
-	} else if sess.VerifiedPhone == "" {
+	} else {
+		enrollHidden, grantHidden, grantPhone := "", " hidden", ""
+		if sess.VerifiedPhone != "" {
+			enrollHidden, grantHidden = " hidden", ""
+			grantPhone = html.EscapeString(sess.VerifiedPhone)
+		}
 		b.WriteString(enrolledCard +
-			`<div class="card"><h2>Enroll new phone number</h2>` +
+			`<div class="card" id="enrollCard"` + enrollHidden + `><h2>Enroll new phone number</h2>` +
 			`<p class="sub">Verify ownership via SMS, then grant voice access. Numbers you already enrolled stay active.</p>` +
 			`<div class="row"><button id="enrollNew">Enroll new phone number</button></div></div>` +
 			verifyCard(true) +
-			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
-	} else {
-		b.WriteString(enrolledCard +
-			`<div class="card"><h2>Step 3 — Grant voice access</h2>` +
-			`<p><span class="pill">` + html.EscapeString(sess.VerifiedPhone) + `</span></p>` +
+			`<div class="card" id="grantCard"` + grantHidden + `><h2>Step 3 — Grant voice access</h2>` +
+			`<p><span class="pill" id="grantPhone">` + grantPhone + `</span></p>` +
 			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
 			`<label for="apikey">LibreChat API key</label>` +
 			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
@@ -540,10 +548,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
 			`<div class="row"><button id="grant">Grant access</button>` +
 			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>` +
-			verifyCard(true) +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
 	b.WriteString(`</main><script>
+window.__verifiedPhone="` + html.EscapeString(sess.VerifiedPhone) + `";
 const status=document.getElementById('status');
 function say(msg,cls){if(!status)return;status.textContent=msg;status.className=cls||'';}
 async function post(url,body){
@@ -577,16 +585,17 @@ async function refreshEnrolled(){
   }catch(e){box.textContent='Could not load enrolled numbers.';}
 }
 refreshEnrolled();
+function show(el,on){if(el)el.hidden=!on;}
 const enrollNew=document.getElementById('enrollNew');
-if(enrollNew)enrollNew.onclick=()=>{const vc=document.getElementById('verifyCard');if(vc)vc.hidden=false;enrollNew.closest('.card').hidden=true;};
+if(enrollNew)enrollNew.onclick=()=>{show(document.getElementById('verifyCard'),true);show(document.getElementById('enrollCard'),false);};
 const useDifferent=document.getElementById('useDifferent');
-if(useDifferent)useDifferent.onclick=()=>{const vc=document.getElementById('verifyCard');if(vc)vc.hidden=!vc.hidden;};
+if(useDifferent)useDifferent.onclick=()=>{show(document.getElementById('grantCard'),false);show(document.getElementById('verifyCard'),true);};
 const send=document.getElementById('send');
 if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',{phone:phoneVal()});say('Code sent — check SMS.','ok');}catch(e){say(e.message,'err');}};
 const verify=document.getElementById('verify');
-if(verify)verify.onclick=async()=>{say('Verifying…');try{const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:phoneVal(),code:c});location.reload();}catch(e){say(e.message,'err');}};
+if(verify)verify.onclick=async()=>{say('Verifying…');try{const p=phoneVal();const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:p,code:c});window.__verifiedPhone=p;const gp=document.getElementById('grantPhone');if(gp)gp.textContent=p;show(document.getElementById('verifyCard'),false);show(document.getElementById('enrollCard'),false);show(document.getElementById('grantCard'),true);say('Verified — grant voice access below.','ok');}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
-if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});location.reload();}catch(e){say(e.message,'err');}};
+if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});window.__verifiedPhone='';const ak=document.getElementById('apikey');if(ak)ak.value='';const pk=document.getElementById('pin');if(pk)pk.value='';show(document.getElementById('grantCard'),false);show(document.getElementById('enrollCard'),true);say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
 </script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
