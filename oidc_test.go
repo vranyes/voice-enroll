@@ -47,6 +47,10 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 		}})
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil || r.FormValue("code_verifier") == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 		id := f.mint("test-sub", "test-client", "test-nonce", time.Now().Add(time.Hour))
 		json.NewEncoder(w).Encode(map[string]string{"id_token": id, "access_token": "at"})
 	})
@@ -83,14 +87,31 @@ func TestOIDCLoginURL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	login, err := c.LoginURL(t.Context(), "state123", "nonce123")
+	login, err := c.LoginURL(t.Context(), "state123", "nonce123", "test-verifier")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"state123", "nonce123", "response_type=code", "test-client"} {
+	for _, want := range []string{"state123", "nonce123", "response_type=code", "test-client", "code_challenge_method=S256", "code_challenge="} {
 		if !strings.Contains(login, want) {
 			t.Fatalf("login URL missing %q: %s", want, login)
 		}
+	}
+	if !strings.Contains(login, CodeChallengeS256("test-verifier")) {
+		t.Fatalf("login URL has wrong challenge: %s", login)
+	}
+}
+
+func TestPKCEChallengeVector(t *testing.T) {
+	// RFC 7636 appendix B test vector.
+	if got := CodeChallengeS256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"); got != "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" {
+		t.Fatalf("challenge mismatch: %q", got)
+	}
+	v, err := NewCodeVerifier()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v) != 43 {
+		t.Fatalf("verifier length %d, want 43", len(v))
 	}
 }
 
@@ -98,7 +119,7 @@ func TestOIDCExchangeVerifies(t *testing.T) {
 	f := newFakeProvider(t)
 	defer f.srv.Close()
 	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", ClientSecret: "s", RedirectURL: "https://enroll/x/cb", HTTPClient: f.srv.Client()}
-	sub, at, err := c.Exchange(t.Context(), "code", "test-nonce")
+	sub, at, err := c.Exchange(t.Context(), "code", "test-nonce", "test-verifier")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,11 +128,20 @@ func TestOIDCExchangeVerifies(t *testing.T) {
 	}
 }
 
+func TestOIDCExchangeRequiresVerifier(t *testing.T) {
+	f := newFakeProvider(t)
+	defer f.srv.Close()
+	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", ClientSecret: "s", RedirectURL: "https://enroll/x/cb", HTTPClient: f.srv.Client()}
+	if _, _, err := c.Exchange(t.Context(), "code", "test-nonce", ""); err == nil {
+		t.Fatal("missing verifier accepted")
+	}
+}
+
 func TestOIDCExchangeRejectsBadNonce(t *testing.T) {
 	f := newFakeProvider(t)
 	defer f.srv.Close()
 	c := OIDCConfig{Issuer: f.iss, ClientID: "test-client", ClientSecret: "s", RedirectURL: "https://enroll/x/cb", HTTPClient: f.srv.Client()}
-	if _, _, err := c.Exchange(t.Context(), "code", "wrong-nonce"); err == nil {
+	if _, _, err := c.Exchange(t.Context(), "code", "wrong-nonce", "test-verifier"); err == nil {
 		t.Fatal("wrong nonce accepted")
 	}
 }

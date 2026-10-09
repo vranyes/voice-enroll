@@ -109,9 +109,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	verifier, err := NewCodeVerifier()
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	http.SetCookie(w, &http.Cookie{Name: "oauth_state", Value: state, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.SetCookie(w, &http.Cookie{Name: "oauth_nonce", Value: nonce, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	dest, err := s.oidc.LoginURL(r.Context(), state, nonce)
+	http.SetCookie(w, &http.Cookie{Name: "oauth_verifier", Value: verifier, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	dest, err := s.oidc.LoginURL(r.Context(), state, nonce, verifier)
 	if err != nil {
 		log.Printf("login: discovery failed")
 		http.Error(w, "auth unavailable", http.StatusBadGateway)
@@ -128,11 +134,12 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := r.Cookie("oauth_state")
 	nn, err2 := r.Cookie("oauth_nonce")
-	if err != nil || err2 != nil || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
+	pkv, err3 := r.Cookie("oauth_verifier")
+	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
 		http.Error(w, "bad state", http.StatusBadRequest)
 		return
 	}
-	sub, _, err := s.oidc.Exchange(r.Context(), q.Get("code"), nn.Value)
+	sub, _, err := s.oidc.Exchange(r.Context(), q.Get("code"), nn.Value, pkv.Value)
 	if err != nil {
 		log.Printf("callback: exchange failed for sub=%s", "unknown")
 		http.Error(w, "login failed", http.StatusUnauthorized)
@@ -142,6 +149,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	s.setSession(w, Session{Sub: sub, ExpiresAt: s.now().Add(s.sessionTTL)})
 	http.SetCookie(w, &http.Cookie{Name: "oauth_state", MaxAge: -1, Path: "/"})
 	http.SetCookie(w, &http.Cookie{Name: "oauth_nonce", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: "oauth_verifier", MaxAge: -1, Path: "/"})
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 

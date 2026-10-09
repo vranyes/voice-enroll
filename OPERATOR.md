@@ -51,8 +51,8 @@ same way taskmaster/voice-bridge do.
   trust-based (documented in `store.go`; stealing a key already grants direct
   access, binding gains nothing).
 - ASSUMED (operator must confirm in Kanidm): confidential code-flow client
-  `voice-enroll` with redirect `https://enroll.vranyes.com/oauth/callback`;
-  `sub` claim contents for cross-matching LibreChat users. The service stores
+  `voice-enroll` with redirect `https://enroll.vranyes.com/oauth/callback`
+  and PKCE S256 enforced; `sub` claim contents for cross-matching LibreChat users. The service stores
   whatever `sub` arrives; LibreChat OIDC matching is sub-first, so a future
   OIDC-bearer path aligns, but the voice path keys on (phone, sub) as stored.
 - ASSUMED: Telnyx account has programmable SMS enabled; sender DID supplied

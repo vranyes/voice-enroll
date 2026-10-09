@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -68,27 +69,50 @@ func (c OIDCConfig) discover(ctx context.Context) (*discoveryDoc, error) {
 	return &d, nil
 }
 
-// LoginURL builds the Kanidm authorization URL. state and nonce are caller
-// generated (crypto random, hex) and round-tripped via secure cookies.
-func (c OIDCConfig) LoginURL(ctx context.Context, state, nonce string) (string, error) {
+// NewCodeVerifier generates an RFC 7636 code verifier: 32 random bytes as
+// 43 base64url chars (valid charset, no padding).
+func NewCodeVerifier() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// CodeChallengeS256 returns BASE64URL-ENCODE(SHA256(verifier)) per RFC 7636.
+func CodeChallengeS256(verifier string) string {
+	h := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(h[:])
+}
+
+// LoginURL builds the Kanidm authorization URL with PKCE S256. state and
+// nonce are caller generated (crypto random, hex) and round-tripped via
+// secure cookies; verifier is the PKCE verifier (challenge derived here).
+func (c OIDCConfig) LoginURL(ctx context.Context, state, nonce, verifier string) (string, error) {
 	d, err := c.discover(ctx)
 	if err != nil {
 		return "", err
 	}
 	q := url.Values{
-		"client_id":     {c.ClientID},
-		"redirect_uri":  {c.RedirectURL},
-		"response_type": {"code"},
-		"scope":         {"openid email profile"},
-		"state":         {state},
-		"nonce":         {nonce},
+		"client_id":             {c.ClientID},
+		"redirect_uri":          {c.RedirectURL},
+		"response_type":         {"code"},
+		"scope":                 {"openid email profile"},
+		"state":                 {state},
+		"nonce":                 {nonce},
+		"code_challenge":        {CodeChallengeS256(verifier)},
+		"code_challenge_method": {"S256"},
 	}
 	return d.AuthorizationEndpoint + "?" + q.Encode(), nil
 }
 
 // Exchange trades the authorization code for tokens and returns the verified
-// id_token subject plus the access token for userinfo.
-func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce string) (sub, accessToken string, err error) {
+// id_token subject plus the access token for userinfo. verifier is the PKCE
+// verifier round-tripped via cookie; Kanidm requires it (S256).
+func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce, verifier string) (sub, accessToken string, err error) {
+	if verifier == "" {
+		return "", "", errors.New("oidc: missing PKCE verifier")
+	}
 	d, err := c.discover(ctx)
 	if err != nil {
 		return "", "", err
@@ -99,6 +123,7 @@ func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce string) (sub, 
 		"redirect_uri":  {c.RedirectURL},
 		"client_id":     {c.ClientID},
 		"client_secret": {c.ClientSecret},
+		"code_verifier": {verifier},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.TokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {

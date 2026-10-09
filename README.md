@@ -6,7 +6,7 @@ Reference: `PLAN.md` in `~/personal/taskmaster` (auth + isolation sections).
 ## Flows
 
 1. **Login** — Kanidm OIDC (`GET /login` → `GET /oauth/callback`), confidential
-   code flow, consent prompt on, `state`/`nonce` via secure cookies.
+   code flow, consent prompt on, PKCE S256, `state`/`nonce`/verifier via secure cookies.
 2. **Verify number** — `POST /api/otp/send {"phone"}` → Telnyx SMS 6-digit code
    (sha256 at rest, single-use, 10 min expiry, 5 guesses max, 5 sends/hour per
    number) → `POST /api/otp/verify {"phone","code"}`.
