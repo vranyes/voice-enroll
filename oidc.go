@@ -108,16 +108,46 @@ func (c OIDCConfig) LoginURL(ctx context.Context, state, nonce, verifier string)
 	return d.AuthorizationEndpoint + "?" + q.Encode(), nil
 }
 
+// TokenSet is the usable result of a code exchange or a refresh grant:
+// the verified subject plus bearer material. RefreshToken and ExpiresIn
+// may be empty/zero if the provider omitted them; callers must handle that
+// (fail closed: no usable bearer without an access token).
+type TokenSet struct {
+	Sub          string
+	AccessToken  string
+	RefreshToken string
+	ExpiresIn    time.Duration
+}
+
+// ErrRefreshExpired marks a refresh grant the provider rejected
+// (expired, revoked, or reuse-detected): the user must grant again.
+var ErrRefreshExpired = errors.New("oidc: refresh expired, re-grant required")
+
 // Exchange trades the authorization code for tokens and returns the verified
 // id_token subject plus the access token for userinfo. verifier is the PKCE
 // verifier round-tripped via cookie; Kanidm requires it (S256).
 func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce, verifier string) (sub, accessToken string, err error) {
+	ts, err := c.ExchangeTokens(ctx, code, wantNonce, verifier)
+	if err != nil {
+		return "", "", err
+	}
+	// Login needs identity, not just a bearer: a code exchange without a
+	// verifiable id_token cannot establish who logged in.
+	if ts.Sub == "" {
+		return "", "", errors.New("oidc token: no id_token")
+	}
+	return ts.Sub, ts.AccessToken, nil
+}
+
+// ExchangeTokens is Exchange plus the refresh token and lifetime: the full
+// bearer material the grant-via-OAuth path stores (encrypted) at grant time.
+func (c OIDCConfig) ExchangeTokens(ctx context.Context, code, wantNonce, verifier string) (TokenSet, error) {
 	if verifier == "" {
-		return "", "", errors.New("oidc: missing PKCE verifier")
+		return TokenSet{}, errors.New("oidc: missing PKCE verifier")
 	}
 	d, err := c.discover(ctx)
 	if err != nil {
-		return "", "", err
+		return TokenSet{}, err
 	}
 	form := url.Values{
 		"grant_type":    {"authorization_code"},
@@ -127,34 +157,87 @@ func (c OIDCConfig) Exchange(ctx context.Context, code, wantNonce, verifier stri
 		"client_secret": {c.ClientSecret},
 		"code_verifier": {verifier},
 	}
+	return c.tokenRequest(ctx, d, form, wantNonce)
+}
+
+// RefreshTokens redeems a stored refresh token for a fresh access token.
+// Kanidm rotates refresh tokens: when the response carries a new one the
+// caller must store it and drop the old (reuse of an old token destroys the
+// server-side session). wantSub, when non-empty, must match the refreshed
+// id_token subject when the provider returns one.
+func (c OIDCConfig) RefreshTokens(ctx context.Context, refreshToken, wantSub string) (TokenSet, error) {
+	if refreshToken == "" {
+		return TokenSet{}, ErrRefreshExpired
+	}
+	d, err := c.discover(ctx)
+	if err != nil {
+		return TokenSet{}, err
+	}
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {c.ClientID},
+		"client_secret": {c.ClientSecret},
+	}
+	ts, err := c.tokenRequest(ctx, d, form, "")
+	if err != nil {
+		return TokenSet{}, err
+	}
+	if wantSub != "" && ts.Sub != "" && subtle.ConstantTimeCompare([]byte(ts.Sub), []byte(wantSub)) != 1 {
+		return TokenSet{}, errors.New("oidc: refreshed subject mismatch")
+	}
+	if wantSub != "" && ts.Sub == "" {
+		ts.Sub = wantSub
+	}
+	return ts, nil
+}
+
+// tokenRequest posts a grant to the token endpoint and verifies the result.
+// wantNonce verifies the id_token nonce for code exchanges ("" skips the
+// check, used by refreshes where no nonce was sent).
+func (c OIDCConfig) tokenRequest(ctx context.Context, d *discoveryDoc, form url.Values, wantNonce string) (TokenSet, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.TokenEndpoint, strings.NewReader(form.Encode()))
 	if err != nil {
-		return "", "", err
+		return TokenSet{}, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := c.client().Do(req)
 	if err != nil {
-		return "", "", err
+		return TokenSet{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusBadRequest {
+		// invalid_grant (dead/rotated refresh, bad code) fails closed as
+		// re-grant rather than a retryable transport error.
+		return TokenSet{}, ErrRefreshExpired
+	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("oidc token: status %d", resp.StatusCode)
+		return TokenSet{}, fmt.Errorf("oidc token: status %d", resp.StatusCode)
 	}
 	var tok struct {
-		IDToken     string `json:"id_token"`
-		AccessToken string `json:"access_token"`
+		IDToken      string `json:"id_token"`
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		ExpiresIn    int64  `json:"expires_in"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&tok); err != nil {
-		return "", "", err
+		return TokenSet{}, err
 	}
-	if tok.IDToken == "" {
-		return "", "", errors.New("oidc token: no id_token")
+	if tok.AccessToken == "" {
+		return TokenSet{}, errors.New("oidc token: no access_token")
 	}
-	sub, err = c.verifyIDToken(ctx, d, tok.IDToken, wantNonce)
-	if err != nil {
-		return "", "", err
+	var sub string
+	if tok.IDToken != "" {
+		sub, err = c.verifyIDToken(ctx, d, tok.IDToken, wantNonce)
+		if err != nil {
+			return TokenSet{}, err
+		}
 	}
-	return sub, tok.AccessToken, nil
+	var lifetime time.Duration
+	if tok.ExpiresIn > 0 && tok.ExpiresIn < 86400*365 {
+		lifetime = time.Duration(tok.ExpiresIn) * time.Second
+	}
+	return TokenSet{Sub: sub, AccessToken: tok.AccessToken, RefreshToken: tok.RefreshToken, ExpiresIn: lifetime}, nil
 }
 
 // verifyIDToken checks signature (RS256 or ES256 via JWKS), iss, aud, exp

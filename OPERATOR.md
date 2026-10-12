@@ -2,8 +2,12 @@
 
 Self-service enrollment portal + internal directory for the voice call path.
 Users log in via Kanidm, prove a phone number via Telnyx SMS OTP, and grant
-voice access by pasting a LibreChat Remote Agents API key (verified live,
-stored AES-GCM-encrypted in Postgres).
+voice access either via Kanidm OAuth login (preferred, no key to copy —
+`POST /api/grant/oauth/start` then `GET /oauth/grant/callback` stores the
+access + rotating refresh token AES-GCM-encrypted) or by pasting a LibreChat
+Remote Agents API key as fallback (verified live, stored AES-GCM-encrypted
+in Postgres). Dual-auth rows may hold both; resolve serves the OAuth bearer
+first and falls back to the PAT.
 
 ## Values the operator must supply (nothing works without all of these)
 
