@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -16,7 +17,42 @@ func fakeOIDC(t *testing.T) (*fakeProvider, OIDCConfig) {
 	f := newFakeProvider(t)
 	return f, OIDCConfig{
 		Issuer: f.iss, ClientID: "test-client", ClientSecret: "s",
-		RedirectURL: "https://enroll/x/grant-cb", HTTPClient: f.srv.Client(),
+		RedirectURL: "https://enroll/x/cb", GrantRedirectURL: "https://enroll/x/grant-cb",
+		HTTPClient: f.srv.Client(),
+	}
+}
+
+func TestLoadConfigGrantRedirect(t *testing.T) {
+	setBaseEnv := func() {
+		t.Helper()
+		t.Setenv("ENROLL_DEK_B64", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("ENROLL_SESSION_SECRET_B64", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+		t.Setenv("KANIDM_ISSUER", "https://auth.example.com/oauth2/openid/voice-enroll-app")
+		t.Setenv("KANIDM_CLIENT_ID", "voice-enroll-app")
+		t.Setenv("KANIDM_CLIENT_SECRET", "s")
+		t.Setenv("KANIDM_REDIRECT_URL", "https://enroll.example.com/oauth/callback")
+		t.Setenv("ENROLL_PUBLIC_BASE_URL", "https://enroll.example.com")
+		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("LIBRECHAT_BASE_URL", "https://librechat.example.com")
+		t.Setenv("TELNYX_API_KEY", "k")
+		t.Setenv("TELNYX_SENDER_NUMBER", "+15550001111")
+	}
+	setBaseEnv()
+	t.Setenv("KANIDM_GRANT_REDIRECT_URL", "")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OIDC.GrantRedirectURL != "https://enroll.example.com/oauth/grant/callback" {
+		t.Fatalf("default grant redirect = %q", cfg.OIDC.GrantRedirectURL)
+	}
+	t.Setenv("KANIDM_GRANT_REDIRECT_URL", "https://enroll.example.com/oauth/grant2/callback")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OIDC.GrantRedirectURL != "https://enroll.example.com/oauth/grant2/callback" {
+		t.Fatalf("explicit grant redirect = %q", cfg.OIDC.GrantRedirectURL)
 	}
 }
 
@@ -102,6 +138,12 @@ func doGrantStart(t *testing.T, s *Server, sub, phone, pin string) []*http.Cooki
 	}
 	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil || body.LoginURL == "" {
 		t.Fatalf("grant start: no login_url (%s)", rr.Body.String())
+	}
+	// The grant flow must authorize with the grant callback, never the login
+	// callback: Kanidm delivers the code to redirect_uri, and the login
+	// handler rejects grant codes as "bad state".
+	if !strings.Contains(body.LoginURL, "redirect_uri="+url.QueryEscape("https://enroll/x/grant-cb")) {
+		t.Fatalf("grant start login_url uses wrong redirect_uri: %s", body.LoginURL)
 	}
 	return rr.Result().Cookies()
 }

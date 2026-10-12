@@ -29,8 +29,14 @@ type OIDCConfig struct {
 	Issuer       string // e.g. https://auth.vranyes.com/oauth2/openid/voice-enroll
 	ClientID     string
 	ClientSecret string
-	RedirectURL  string // e.g. https://enroll.vranyes.com/oauth/callback
-	HTTPClient   *http.Client
+	RedirectURL  string // login callback, e.g. https://enroll.vranyes.com/oauth/callback
+	// GrantRedirectURL is the grant-via-OAuth callback
+	// (e.g. https://enroll.vranyes.com/oauth/grant/callback). It must be a
+	// separate registered redirect URI: reusing the login callback would
+	// deliver the grant code to the login handler, which rejects it as
+	// "bad state". Empty means "same as RedirectURL" (login-only setups).
+	GrantRedirectURL string
+	HTTPClient       *http.Client
 }
 
 type discoveryDoc struct {

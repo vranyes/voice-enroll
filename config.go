@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -66,6 +67,14 @@ func LoadConfig() (Config, error) {
 	}
 	if c.OIDC.Issuer == "" || c.OIDC.ClientID == "" || c.OIDC.ClientSecret == "" || c.OIDC.RedirectURL == "" {
 		return c, errors.New("KANIDM_ISSUER/CLIENT_ID/CLIENT_SECRET/REDIRECT_URL all required")
+	}
+	// Grant-via-OAuth needs its own registered redirect URI (see OIDCConfig).
+	// Explicit env wins; otherwise derive from the public base URL so the
+	// callback and the Kanidm client registration agree by construction.
+	if grant := strings.TrimSpace(getenv("KANIDM_GRANT_REDIRECT_URL")); grant != "" {
+		c.OIDC.GrantRedirectURL = grant
+	} else {
+		c.OIDC.GrantRedirectURL = strings.TrimRight(c.PublicBaseURL, "/") + "/oauth/grant/callback"
 	}
 	if c.PublicBaseURL == "" || c.DatabaseURL == "" || c.LibreChatBase == "" {
 		return c, errors.New("ENROLL_PUBLIC_BASE_URL/DATABASE_URL/LIBRECHAT_BASE_URL all required")

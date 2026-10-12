@@ -173,6 +173,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	nn, err2 := r.Cookie("oauth_nonce")
 	pkv, err3 := r.Cookie("oauth_verifier")
 	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
+		log.Printf("callback: bad state (missing login cookies or state mismatch)")
 		http.Error(w, "bad state", http.StatusBadRequest)
 		return
 	}
@@ -352,6 +353,19 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 }
 
+// grantOIDC returns the OIDC client for the grant-via-OAuth code flow: same
+// issuer/client/secret as login, but the grant callback as redirect_uri so
+// the grant code lands on the grant handler (not the login handler, which
+// would reject it as "bad state"). Both the authorize URL and the code
+// exchange must use this config or Kanidm rejects the redirect mismatch.
+func (s *Server) grantOIDC() OIDCConfig {
+	gc := s.oidc
+	if gc.GrantRedirectURL != "" {
+		gc.RedirectURL = gc.GrantRedirectURL
+	}
+	return gc
+}
+
 type grantOAuthStartReq struct {
 	PIN string `json:"pin"`
 }
@@ -412,7 +426,7 @@ func (s *Server) handleGrantOAuthStart(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{Name: "grant_state", Value: state, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.SetCookie(w, &http.Cookie{Name: "grant_nonce", Value: nonce, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.SetCookie(w, &http.Cookie{Name: "grant_verifier", Value: verifier, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	dest, err := s.oidc.LoginURL(r.Context(), state, nonce, verifier)
+	dest, err := s.grantOIDC().LoginURL(r.Context(), state, nonce, verifier)
 	if err != nil {
 		log.Printf("grant oauth start: discovery failed")
 		http.Error(w, "auth unavailable", http.StatusBadGateway)
@@ -441,10 +455,11 @@ func (s *Server) handleGrantOAuthCallback(w http.ResponseWriter, r *http.Request
 	nn, err2 := r.Cookie("grant_nonce")
 	pkv, err3 := r.Cookie("grant_verifier")
 	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
+		log.Printf("grant callback: bad state (missing grant cookies or state mismatch)")
 		http.Error(w, "bad state", http.StatusBadRequest)
 		return
 	}
-	ts, err := s.oidc.ExchangeTokens(r.Context(), q.Get("code"), nn.Value, pkv.Value)
+	ts, err := s.grantOIDC().ExchangeTokens(r.Context(), q.Get("code"), nn.Value, pkv.Value)
 	if err != nil {
 		log.Printf("grant callback: exchange failed: %v", err)
 		http.Error(w, "grant failed", http.StatusUnauthorized)
