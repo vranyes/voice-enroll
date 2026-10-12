@@ -3,20 +3,10 @@ package enroll
 import (
 	"context"
 	"errors"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// nullTime maps the zero time to NULL so OAuth-less (PAT-only) rows carry no
-// token expiry instead of the year-1 timestamp.
-func nullTime(t time.Time) *time.Time {
-	if t.IsZero() {
-		return nil
-	}
-	return &t
-}
 
 // PGStore is the deploy backend: the cnpg Postgres directory.
 type PGStore struct{ pool *pgxpool.Pool }
@@ -50,11 +40,6 @@ CREATE TABLE IF NOT EXISTS enrollments (
 );
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_pin BYTEA;
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS pin_nonce BYTEA;
-ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_access BYTEA NOT NULL DEFAULT '\x';
-ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS access_nonce BYTEA NOT NULL DEFAULT '\x';
-ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_refresh BYTEA NOT NULL DEFAULT '\x';
-ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS refresh_nonce BYTEA NOT NULL DEFAULT '\x';
-ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS otp_codes (
   phone        TEXT PRIMARY KEY,
   code_hash    BYTEA NOT NULL,
@@ -99,38 +84,25 @@ ON CONFLICT (phone) DO UPDATE SET
 
 func (s *PGStore) UpsertEnrollment(ctx context.Context, e Enrollment) error {
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO enrollments (phone, user_sub, enc_key, nonce, enc_pin, pin_nonce,
-  enc_access, access_nonce, enc_refresh, refresh_nonce, token_expires_at, verified_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+INSERT INTO enrollments (phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,now())
 ON CONFLICT (phone) DO UPDATE SET
   user_sub=EXCLUDED.user_sub, enc_key=EXCLUDED.enc_key, nonce=EXCLUDED.nonce,
   enc_pin=EXCLUDED.enc_pin, pin_nonce=EXCLUDED.pin_nonce,
-  enc_access=EXCLUDED.enc_access, access_nonce=EXCLUDED.access_nonce,
-  enc_refresh=EXCLUDED.enc_refresh, refresh_nonce=EXCLUDED.refresh_nonce,
-  token_expires_at=EXCLUDED.token_expires_at,
   verified_at=EXCLUDED.verified_at, updated_at=now()`,
-		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.EncPIN, e.PINNonce,
-		e.EncAccess, e.AccessNonce, e.EncRefresh, e.RefreshNonce,
-		nullTime(e.TokenExpiresAt), e.VerifiedAt)
+		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.EncPIN, e.PINNonce, e.VerifiedAt)
 	return err
 }
 
 func (s *PGStore) GetByPhone(ctx context.Context, phone string) (*Enrollment, error) {
 	var e Enrollment
-	var tokenExp *time.Time
-	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, enc_pin, pin_nonce,
-  enc_access, access_nonce, enc_refresh, refresh_nonce, token_expires_at, verified_at
-FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce,
-		&e.EncPIN, &e.PINNonce, &e.EncAccess, &e.AccessNonce, &e.EncRefresh, &e.RefreshNonce,
-		&tokenExp, &e.VerifiedAt)
+	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at
+FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce, &e.EncPIN, &e.PINNonce, &e.VerifiedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
-	}
-	if tokenExp != nil {
-		e.TokenExpiresAt = *tokenExp
 	}
 	return &e, nil
 }

@@ -57,34 +57,12 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 		}})
 	})
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
-		if err := r.ParseForm(); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		// Refresh branch: only the known-good refresh redeems; anything
-		// else fails closed as invalid_grant (expiry/reuse/revocation).
-		// Rotation is honored: each redemption returns a new refresh token.
-		if r.FormValue("grant_type") == "refresh_token" {
-			if r.FormValue("refresh_token") != "good-refresh" {
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			id := f.mint("test-sub", "test-client", "", time.Now().Add(time.Hour))
-			json.NewEncoder(w).Encode(map[string]any{
-				"id_token": id, "access_token": "at2",
-				"refresh_token": "good-refresh-2", "expires_in": 900,
-			})
-			return
-		}
-		if r.FormValue("code_verifier") == "" {
+		if err := r.ParseForm(); err != nil || r.FormValue("code_verifier") == "" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		id := f.mint("test-sub", "test-client", "test-nonce", time.Now().Add(time.Hour))
-		json.NewEncoder(w).Encode(map[string]any{
-			"id_token": id, "access_token": "at",
-			"refresh_token": "good-refresh", "expires_in": 900,
-		})
+		json.NewEncoder(w).Encode(map[string]string{"id_token": id, "access_token": "at"})
 	})
 	mux.HandleFunc("/me", func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"sub": "test-sub"})

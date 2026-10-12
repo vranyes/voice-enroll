@@ -2,12 +2,20 @@
 
 Self-service enrollment portal + internal directory for the voice call path.
 Users log in via Kanidm, prove a phone number via Telnyx SMS OTP, and grant
-voice access either via Kanidm OAuth login (preferred, no key to copy —
-`POST /api/grant/oauth/start` then `GET /oauth/grant/callback` stores the
-access + rotating refresh token AES-GCM-encrypted) or by pasting a LibreChat
-Remote Agents API key as fallback (verified live, stored AES-GCM-encrypted
-in Postgres). Dual-auth rows may hold both; resolve serves the OAuth bearer
-first and falls back to the PAT.
+voice access by pasting a LibreChat Remote Agents API key (verified live,
+stored AES-GCM-encrypted in Postgres).
+
+> OAuth-grant spike (2026-10-12, reverted): storing Kanidm bearer material at
+> grant time instead of a pasted PAT was attempted and removed. The Kanidm
+> tokens themselves validate fine against LibreChat's Remote Agents OIDC
+> auth, but LibreChat (v0.8.8) binds remote-API users to the token issuer
+> (`findOpenIDUser` matches `openidId` + `openidIssuer`), and Kanidm mints a
+> distinct issuer per OAuth2 client. Voice-enroll-app tokens can therefore
+> never match users created via the librechat-app login — every grant failed
+> with `[remoteAgentAuth] OIDC token valid but no matching LibreChat user`.
+> Do not retry without multi-issuer trust in LibreChat's remoteApi OIDC
+> (upstream feature request). Kanidm's lack of offline sessions (#4034) is a
+> second, independent blocker for the same idea.
 
 ## Values the operator must supply (nothing works without all of these)
 

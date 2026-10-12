@@ -1,39 +1,17 @@
 package enroll
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"html"
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 )
-
-// oauthRefreshSkew refreshes an access token that expires within this window,
-// so resolve never hands out a bearer that dies mid-call.
-const oauthRefreshSkew = 90 * time.Second
-
-// pendingGrantSkew bounds the grant-via-OAuth handshake: the PIN stashed at
-// /api/grant/oauth/start must be consumed by /oauth/grant/callback within
-// this window or the user starts over.
-const pendingGrantTTL = 10 * time.Minute
-
-// pendingGrant is a PIN awaiting its OAuth grant: the user proved number
-// ownership (OTP) and chose a PIN, and must now complete the Kanidm code
-// flow. The PIN is AES-GCM-encrypted at stash time, never plaintext at rest.
-type pendingGrant struct {
-	phone     string
-	encPIN    []byte
-	pinNonce  []byte
-	expiresAt time.Time
-}
 
 // Server wires the enrollment flows. Two listeners (see cmd/voice-enroll):
 // publicMux serves the browser UI (no /resolve — 404 there by construction);
@@ -49,15 +27,6 @@ type Server struct {
 	httpClient *http.Client
 	now        func() time.Time
 	sessionTTL time.Duration
-
-	// Grants-in-flight for the OAuth path (single replica: memory is fine;
-	// a restart only forces the user to click "grant" again, fail-closed).
-	// refreshMu serializes token refreshes so two concurrent resolves for
-	// the same number cannot redeem the same rotating refresh token twice
-	// (Kanidm treats reuse as theft and destroys the session).
-	pendingMu sync.Mutex
-	pending   map[string]pendingGrant // sub -> grant
-	refreshMu sync.Mutex
 }
 
 func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, sms SMSSender, smsFrom, libreChat string) *Server {
@@ -67,7 +36,6 @@ func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, 
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 		now:        time.Now,
 		sessionTTL: 12 * time.Hour,
-		pending:    map[string]pendingGrant{},
 	}
 }
 
@@ -88,8 +56,6 @@ func (s *Server) PublicMux() *http.ServeMux {
 	m.HandleFunc("POST /api/otp/send", s.handleOTPSend)
 	m.HandleFunc("POST /api/otp/verify", s.handleOTPVerify)
 	m.HandleFunc("POST /api/grant", s.handleGrant)
-	m.HandleFunc("POST /api/grant/oauth/start", s.handleGrantOAuthStart)
-	m.HandleFunc("GET /oauth/grant/callback", s.handleGrantOAuthCallback)
 	m.HandleFunc("POST /api/revoke", s.handleRevoke)
 	m.HandleFunc("GET /api/enrollments", s.handleListEnrollments)
 	return m
@@ -173,7 +139,6 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	nn, err2 := r.Cookie("oauth_nonce")
 	pkv, err3 := r.Cookie("oauth_verifier")
 	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
-		log.Printf("callback: bad state (missing login cookies or state mismatch)")
 		http.Error(w, "bad state", http.StatusBadRequest)
 		return
 	}
@@ -327,20 +292,11 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	// Dual-auth: a PAT (re)grant must not wipe an existing OAuth grant for
-	// the same number. Preserve stored bearer material; the OAuth path below
-	// preserves the PAT symmetrically.
-	e := Enrollment{
+	if err := s.store.UpsertEnrollment(r.Context(), Enrollment{
 		Phone: phoneOf(sess), UserSub: sess.Sub,
 		EncKey: ct, Nonce: nonce, EncPIN: pinCT, PINNonce: pinNonce,
 		VerifiedAt: s.now(),
-	}
-	if old, err := s.store.GetByPhone(r.Context(), phoneOf(sess)); err == nil && old != nil && old.UserSub == sess.Sub {
-		e.EncAccess, e.AccessNonce = old.EncAccess, old.AccessNonce
-		e.EncRefresh, e.RefreshNonce = old.EncRefresh, old.RefreshNonce
-		e.TokenExpiresAt = old.TokenExpiresAt
-	}
-	if err := s.store.UpsertEnrollment(r.Context(), e); err != nil {
+	}); err != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -351,253 +307,6 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 	s.setSession(w, sess)
 	log.Printf("grant stored sub=%s", hashID(sess.Sub))
 	w.WriteHeader(http.StatusCreated)
-}
-
-// grantOIDC returns the OIDC client for the grant-via-OAuth code flow: same
-// issuer/client/secret as login, but the grant callback as redirect_uri so
-// the grant code lands on the grant handler (not the login handler, which
-// would reject it as "bad state"). Both the authorize URL and the code
-// exchange must use this config or Kanidm rejects the redirect mismatch.
-func (s *Server) grantOIDC() OIDCConfig {
-	gc := s.oidc
-	if gc.GrantRedirectURL != "" {
-		gc.RedirectURL = gc.GrantRedirectURL
-	}
-	return gc
-}
-
-type grantOAuthStartReq struct {
-	PIN string `json:"pin"`
-}
-
-// handleGrantOAuthStart begins grant-via-OAuth: the user proved number
-// ownership (OTP, in VerifiedPhone) and chose a PIN, and now completes a
-// Kanidm code flow instead of pasting a PAT. The PIN is encrypted into a
-// short-lived pending grant keyed by sub; the response carries the Kanidm
-// login URL the browser must visit. The PAT paste form stays as fallback.
-func (s *Server) handleGrantOAuthStart(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.currentSession(r)
-	if !ok || sess.VerifiedPhone == "" {
-		http.Error(w, "login and verified number required", http.StatusUnauthorized)
-		return
-	}
-	var req grantOAuthStartReq
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
-		http.Error(w, "bad request", http.StatusBadRequest)
-		return
-	}
-	pin := strings.TrimSpace(req.PIN)
-	if err := ValidatePIN(pin); err != nil {
-		http.Error(w, "invalid PIN: need 4-12 digits", http.StatusBadRequest)
-		return
-	}
-	pinNonce, pinCT, err := s.keys.Encrypt([]byte(pin))
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	state, err := randHex(16)
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	nonce, err := randHex(16)
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	verifier, err := NewCodeVerifier()
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	s.pendingMu.Lock()
-	now := s.now()
-	for sub, p := range s.pending {
-		if !p.expiresAt.After(now) {
-			delete(s.pending, sub)
-		}
-	}
-	s.pending[sess.Sub] = pendingGrant{
-		phone: phoneOf(sess), encPIN: pinCT, pinNonce: pinNonce,
-		expiresAt: now.Add(pendingGrantTTL),
-	}
-	s.pendingMu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "grant_state", Value: state, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	http.SetCookie(w, &http.Cookie{Name: "grant_nonce", Value: nonce, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	http.SetCookie(w, &http.Cookie{Name: "grant_verifier", Value: verifier, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	dest, err := s.grantOIDC().LoginURL(r.Context(), state, nonce, verifier)
-	if err != nil {
-		log.Printf("grant oauth start: discovery failed")
-		http.Error(w, "auth unavailable", http.StatusBadGateway)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"login_url": dest})
-}
-
-// handleGrantOAuthCallback completes grant-via-OAuth: it exchanges the code
-// for bearer material, verifies the access token live against LibreChat
-// (fail-closed like the PAT path), and stores it encrypted alongside the
-// stashed PIN. Any stored PAT for the number is preserved (dual-auth).
-func (s *Server) handleGrantOAuthCallback(w http.ResponseWriter, r *http.Request) {
-	sess, ok := s.currentSession(r)
-	if !ok {
-		http.Error(w, "login required", http.StatusUnauthorized)
-		return
-	}
-	q := r.URL.Query()
-	if q.Get("error") != "" {
-		http.Error(w, "grant denied", http.StatusUnauthorized)
-		return
-	}
-	st, err := r.Cookie("grant_state")
-	nn, err2 := r.Cookie("grant_nonce")
-	pkv, err3 := r.Cookie("grant_verifier")
-	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
-		log.Printf("grant callback: bad state (missing grant cookies or state mismatch)")
-		http.Error(w, "bad state", http.StatusBadRequest)
-		return
-	}
-	ts, err := s.grantOIDC().ExchangeTokens(r.Context(), q.Get("code"), nn.Value, pkv.Value)
-	if err != nil {
-		log.Printf("grant callback: exchange failed: %v", err)
-		http.Error(w, "grant failed", http.StatusUnauthorized)
-		return
-	}
-	// The grant binds to the login session: a code minted for another user
-	// cannot enroll this session's number.
-	if ts.Sub == "" || subtle.ConstantTimeCompare([]byte(ts.Sub), []byte(sess.Sub)) != 1 {
-		log.Printf("grant callback: subject mismatch sub=%s", hashID(sess.Sub))
-		http.Error(w, "grant failed", http.StatusUnauthorized)
-		return
-	}
-	if err := VerifyLibreChatKey(r.Context(), s.httpClient, s.libreChat, ts.AccessToken); err != nil {
-		if errors.Is(err, ErrInvalidKey) {
-			log.Printf("grant callback: LibreChat rejected OAuth bearer sub=%s", hashID(sess.Sub))
-			http.Error(w, "LibreChat rejected the grant (is OIDC auth enabled on the Agents API?)", http.StatusBadRequest)
-			return
-		}
-		http.Error(w, "verification unavailable", http.StatusBadGateway)
-		return
-	}
-	s.pendingMu.Lock()
-	p, found := s.pending[sess.Sub]
-	if found {
-		delete(s.pending, sess.Sub)
-	}
-	s.pendingMu.Unlock()
-	if !found || s.now().After(p.expiresAt) {
-		http.Error(w, "grant expired, start over", http.StatusBadRequest)
-		return
-	}
-	accNonce, accCT, err := s.keys.Encrypt([]byte(ts.AccessToken))
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	e := Enrollment{
-		Phone: p.phone, UserSub: sess.Sub,
-		EncPIN: p.encPIN, PINNonce: p.pinNonce,
-		EncAccess: accCT, AccessNonce: accNonce,
-		VerifiedAt: s.now(),
-	}
-	if ts.RefreshToken != "" {
-		refNonce, refCT, err := s.keys.Encrypt([]byte(ts.RefreshToken))
-		if err != nil {
-			http.Error(w, "unavailable", http.StatusServiceUnavailable)
-			return
-		}
-		e.EncRefresh, e.RefreshNonce = refCT, refNonce
-	}
-	e.TokenExpiresAt = s.now().Add(oauthAccessLifetime(ts.ExpiresIn))
-	// Dual-auth: preserve any stored PAT for the number.
-	if old, err := s.store.GetByPhone(r.Context(), p.phone); err == nil && old != nil && old.UserSub == sess.Sub {
-		e.EncKey, e.Nonce = old.EncKey, old.Nonce
-	}
-	if err := s.store.UpsertEnrollment(r.Context(), e); err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	sess.VerifiedPhone = ""
-	s.setSession(w, sess)
-	http.SetCookie(w, &http.Cookie{Name: "grant_state", MaxAge: -1, Path: "/"})
-	http.SetCookie(w, &http.Cookie{Name: "grant_nonce", MaxAge: -1, Path: "/"})
-	http.SetCookie(w, &http.Cookie{Name: "grant_verifier", MaxAge: -1, Path: "/"})
-	log.Printf("grant oauth stored sub=%s", hashID(sess.Sub))
-	http.Redirect(w, r, "/", http.StatusFound)
-}
-
-// oauthAccessLifetime bounds the stored access-token expiry. Kanidm mints
-// 15-minute access tokens (see its oauth2_refresh_tokens design); when the
-// provider omits expires_in we assume that rather than treating the bearer
-// as immortal or instantly dead.
-func oauthAccessLifetime(expiresIn time.Duration) time.Duration {
-	if expiresIn > 0 {
-		return expiresIn
-	}
-	return 15 * time.Minute
-}
-
-// freshAccessToken returns a live Kanidm access token for the enrollment,
-// redeeming the stored refresh token when the access token is missing,
-// expired, or expiring within the skew window. Rotation is honored: a new
-// refresh token replaces the old (reuse of an old one destroys the Kanidm
-// session). Refreshes serialize across resolves so concurrent calls cannot
-// double-redeem. Any failure is fail-closed to the caller, which falls back
-// to the stored PAT when one exists and otherwise denies.
-func (s *Server) freshAccessToken(ctx context.Context, e *Enrollment) (string, error) {
-	if !e.HasOAuth() {
-		return "", errors.New("no oauth grant")
-	}
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
-	// Re-read under the lock: a concurrent resolve may have just rotated.
-	fresh, err := s.store.GetByPhone(ctx, e.Phone)
-	if err != nil || fresh == nil {
-		return "", errors.New("unavailable")
-	}
-	e = fresh
-	if !e.HasOAuth() {
-		return "", errors.New("no oauth grant")
-	}
-	access, err := s.keys.Decrypt(e.AccessNonce, e.EncAccess)
-	if err != nil {
-		return "", err
-	}
-	if !e.TokenExpiresAt.IsZero() && s.now().Add(oauthRefreshSkew).Before(e.TokenExpiresAt) {
-		return string(access), nil
-	}
-	if len(e.EncRefresh) == 0 {
-		// Legacy row (no refresh, unknown lifetime): hand out the bearer and
-		// let the downstream call fail closed at use time if it is dead.
-		return string(access), nil
-	}
-	refresh, err := s.keys.Decrypt(e.RefreshNonce, e.EncRefresh)
-	if err != nil {
-		return "", err
-	}
-	ts, err := s.oidc.RefreshTokens(ctx, string(refresh), e.UserSub)
-	if err != nil {
-		return "", err
-	}
-	accNonce, accCT, err := s.keys.Encrypt([]byte(ts.AccessToken))
-	if err != nil {
-		return "", err
-	}
-	e.EncAccess, e.AccessNonce = accCT, accNonce
-	if ts.RefreshToken != "" {
-		refNonce, refCT, err := s.keys.Encrypt([]byte(ts.RefreshToken))
-		if err != nil {
-			return "", err
-		}
-		e.EncRefresh, e.RefreshNonce = refCT, refNonce
-	}
-	e.TokenExpiresAt = s.now().Add(oauthAccessLifetime(ts.ExpiresIn))
-	if err := s.store.UpsertEnrollment(ctx, *e); err != nil {
-		return "", err
-	}
-	return ts.AccessToken, nil
 }
 
 func phoneOf(sess Session) string { return sess.VerifiedPhone }
@@ -703,30 +412,12 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	}
 	out := map[string]string{"user_sub": e.UserSub}
 	if r.URL.Query().Get("reveal") == "key" {
-		// Dual-auth: prefer the OAuth bearer when granted, fall back to the
-		// PAT when the grant is missing or its refresh died (fail-closed to
-		// re-grant when neither yields a bearer).
-		if e.HasOAuth() {
-			if access, err := s.freshAccessToken(r.Context(), e); err == nil {
-				out["access_token"] = access
-			} else {
-				log.Printf("resolve oauth refresh failed sub=%s err=%v", hashID(e.UserSub), err)
-			}
+		plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
+		if err != nil {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
 		}
-		if e.HasPAT() {
-			plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
-			if err != nil {
-				http.Error(w, "unavailable", http.StatusServiceUnavailable)
-				return
-			}
-			out["api_key"] = string(plain)
-		}
-		if _, hasBearer := out["access_token"]; !hasBearer {
-			if _, hasKey := out["api_key"]; !hasKey {
-				deny(w)
-				return
-			}
-		}
+		out["api_key"] = string(plain)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
@@ -850,13 +541,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			verifyCard(true) +
 			`<div class="card" id="grantCard"` + grantHidden + `><h2>Step 3 — Grant voice access</h2>` +
 			`<p><span class="pill" id="grantPhone">` + grantPhone + `</span></p>` +
-			`<p class="sub">Choose a 4-12 digit voice PIN for call-time identification, then grant access. Preferred: Kanidm login (no key to copy). Fallback: paste a LibreChat Remote Agents API key, verified live and stored encrypted.</p>` +
+			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
+			`<label for="apikey">LibreChat API key</label>` +
+			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
 			`<label for="pin">Voice PIN (4-12 digits)</label>` +
 			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
-			`<div class="row"><button id="grantOauth">Grant with Kanidm login</button></div>` +
-			`<label for="apikey">LibreChat API key (fallback)</label>` +
-			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
-			`<div class="row"><button id="grant">Grant with pasted key</button>` +
+			`<div class="row"><button id="grant">Grant access</button>` +
 			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>` +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
@@ -906,8 +596,6 @@ const verify=document.getElementById('verify');
 if(verify)verify.onclick=async()=>{say('Verifying…');try{const p=phoneVal();const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:p,code:c});window.__verifiedPhone=p;const gp=document.getElementById('grantPhone');if(gp)gp.textContent=p;show(document.getElementById('verifyCard'),false);show(document.getElementById('enrollCard'),false);show(document.getElementById('grantCard'),true);say('Verified — grant voice access below.','ok');}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
 if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});window.__verifiedPhone='';const ak=document.getElementById('apikey');if(ak)ak.value='';const pk=document.getElementById('pin');if(pk)pk.value='';show(document.getElementById('grantCard'),false);show(document.getElementById('enrollCard'),true);say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
-const grantOauth=document.getElementById('grantOauth');
-if(grantOauth)grantOauth.onclick=async()=>{say('Starting Kanidm grant…');try{const r=await post('/api/grant/oauth/start',{pin:document.getElementById('pin').value});const data=await r.json();if(!data.login_url)throw new Error('grant start failed');window.location.href=data.login_url;}catch(e){say(e.message,'err');}};
 </script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))

@@ -9,44 +9,28 @@ import (
 
 // Enrollment is one directory row: a verified E.164 number bound to the
 // Kanidm subject that proved ownership of it, plus that subject's
-// call-time credentials, all AES-GCM-encrypted under the sealed DEK:
-//
-//   - the LibreChat Remote Agents API key (PAT path, may be empty when the
-//     user granted via OAuth only) and the voice PIN (4-12 DTMF digits);
-//   - the Kanidm OAuth bearer material (OAuth path, empty on PAT-only rows):
-//     access token, rotating refresh token, and the access token's expiry.
+// AES-GCM-encrypted LibreChat Remote Agents API key and AES-GCM-encrypted
+// voice PIN (4-12 DTMF digits, chosen at grant time).
 //
 // Trust note: the pasted key's owner is opaque to us. Binding key→(sub,phone)
 // is trust-based by design — holding someone else's key already grants direct
 // LibreChat access as them, so binding it here gains an attacker nothing they
 // did not already have. Identity in the resolve response comes from the
-// verified login session + OTP only, never from the key. OAuth tokens need no
-// such caveat: the code flow binds them to the session sub at grant time.
+// verified login session + OTP only, never from the key.
 //
 // PIN note: the PIN is encrypted under the same DEK as the API key (never
 // plaintext at rest) and is only ever compared inside verify-pin or
 // decrypted for that comparison. It never appears in resolve responses
 // or logs.
 type Enrollment struct {
-	Phone          string // normalized E.164
-	UserSub        string // Kanidm `sub` from the verified login session
-	EncKey         []byte // AES-GCM ciphertext of the LibreChat API key (empty on OAuth-only rows)
-	Nonce          []byte
-	EncPIN         []byte // AES-GCM ciphertext of the voice PIN
-	PINNonce       []byte
-	EncAccess      []byte // AES-GCM ciphertext of the Kanidm access token (empty on PAT-only rows)
-	AccessNonce    []byte
-	EncRefresh     []byte // AES-GCM ciphertext of the rotating Kanidm refresh token
-	RefreshNonce   []byte
-	TokenExpiresAt time.Time // access token expiry (zero when no OAuth grant)
-	VerifiedAt     time.Time
+	Phone      string // normalized E.164
+	UserSub    string // Kanidm `sub` from the verified login session
+	EncKey     []byte // AES-GCM ciphertext of the LibreChat API key
+	Nonce      []byte
+	EncPIN     []byte // AES-GCM ciphertext of the voice PIN
+	PINNonce   []byte
+	VerifiedAt time.Time
 }
-
-// HasPAT reports whether a LibreChat API key is stored (PAT fallback path).
-func (e Enrollment) HasPAT() bool { return len(e.EncKey) > 0 }
-
-// HasOAuth reports whether Kanidm bearer material is stored (OAuth path).
-func (e Enrollment) HasOAuth() bool { return len(e.EncAccess) > 0 }
 
 // Store is the enrollment directory. Postgres is the deploy backend;
 // memoryStore is the test/standalone backend behind the same interface.
