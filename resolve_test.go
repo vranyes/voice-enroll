@@ -340,3 +340,91 @@ func TestPublicMuxHasNoVerifyPIN(t *testing.T) {
 		t.Fatal("public mux serves /verify-pin — PIN verifier must be internal-only")
 	}
 }
+
+func seedChatGPTEnrollment(t *testing.T, s *Server, phone, sub, key, pin, access, refresh, account string, exp time.Time) {
+	t.Helper()
+	n, ct, err := s.keys.Encrypt([]byte(key))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pn, pct, err := s.keys.Encrypt([]byte(pin))
+	if err != nil {
+		t.Fatal(err)
+	}
+	an, act, err := s.keys.Encrypt([]byte(access))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rn, rct, err := s.keys.Encrypt([]byte(refresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.store.UpsertEnrollment(context.Background(), Enrollment{
+		Phone: phone, UserSub: sub, EncKey: ct, Nonce: n, EncPIN: pct, PINNonce: pn, VerifiedAt: time.Now(),
+		EncChatGPTAccess: act, ChatGPTAccessNonce: an, EncChatGPTRefresh: rct, ChatGPTRefreshNonce: rn,
+		ChatGPTExpiresAt: exp, ChatGPTAccountID: account,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestResolveRevealCredentialChatGPT(t *testing.T) {
+	s, _ := testServer(t)
+	exp := time.Now().Add(30 * time.Minute)
+	seedChatGPTEnrollment(t, s, "+15550109999", "sub-1", "k", "482916", "access-tok", "refresh-tok", "acct-1", exp)
+	rr := getResolve(t, s, "+15550109999", "credential")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["credential_kind"] != "chatgpt_oauth" {
+		t.Fatalf("kind=%v", out["credential_kind"])
+	}
+	if out["access_token"] != "access-tok" {
+		t.Fatalf("access=%v", out["access_token"])
+	}
+	if out["account_id"] != "acct-1" {
+		t.Fatalf("acct=%v", out["account_id"])
+	}
+	if out["user_sub"] != "sub-1" {
+		t.Fatalf("sub=%v", out["user_sub"])
+	}
+}
+
+func TestResolveRevealCredentialLegacyAPIKey(t *testing.T) {
+	s, _ := testServer(t)
+	seedEnrollment(t, s, "+15550109999", "sub-1", "sk-legacy")
+	rr := getResolve(t, s, "+15550109999", "credential")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rr.Code, rr.Body.String())
+	}
+	var out map[string]any
+	if err := json.NewDecoder(rr.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["credential_kind"] != "api_key" {
+		t.Fatalf("kind=%v", out["credential_kind"])
+	}
+	if out["api_key"] != "sk-legacy" {
+		t.Fatalf("key=%v", out["api_key"])
+	}
+}
+
+func TestResolveRevealCredentialMissingDeniesIdentically(t *testing.T) {
+	s, _ := testServer(t)
+	// Enrollment with no credential material.
+	if err := s.store.UpsertEnrollment(context.Background(), Enrollment{Phone: "+15550109999", UserSub: "sub-1", VerifiedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	rr := getResolve(t, s, "+15550109999", "credential")
+	unknown := getResolve(t, s, "+19998887777", "credential")
+	if rr.Code != http.StatusNotFound || unknown.Code != http.StatusNotFound {
+		t.Fatalf("%d/%d", rr.Code, unknown.Code)
+	}
+	if rr.Body.String() != unknown.Body.String() {
+		t.Fatalf("different bodies: %q vs %q", rr.Body.String(), unknown.Body.String())
+	}
+}

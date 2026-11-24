@@ -1,11 +1,14 @@
 package enroll
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"html"
 	"log"
 	"net/http"
@@ -17,16 +20,17 @@ import (
 // publicMux serves the browser UI (no /resolve — 404 there by construction);
 // internalMux serves GET /resolve only, reachable via ClusterIP alone.
 type Server struct {
-	store      Store
-	oidc       OIDCConfig
-	sessions   *SessionCodec
-	keys       *Key
-	sms        SMSSender
-	smsFrom    string
-	libreChat  string
-	httpClient *http.Client
-	now        func() time.Time
-	sessionTTL time.Duration
+	store         Store
+	oidc          OIDCConfig
+	sessions      *SessionCodec
+	keys          *Key
+	sms           SMSSender
+	smsFrom       string
+	libreChat     string
+	PublicBaseURL string
+	httpClient    *http.Client
+	now           func() time.Time
+	sessionTTL    time.Duration
 }
 
 func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, sms SMSSender, smsFrom, libreChat string) *Server {
@@ -52,6 +56,8 @@ func (s *Server) PublicMux() *http.ServeMux {
 	m.HandleFunc("GET /", s.handleIndex)
 	m.HandleFunc("GET /login", s.handleLogin)
 	m.HandleFunc("GET /oauth/callback", s.handleCallback)
+	m.HandleFunc("GET /oauth/chatgpt/login", s.handleChatGPTLogin)
+	m.HandleFunc("GET /oauth/chatgpt/callback", s.handleChatGPTCallback)
 	m.HandleFunc("POST /logout", s.handleLogout)
 	m.HandleFunc("POST /api/otp/send", s.handleOTPSend)
 	m.HandleFunc("POST /api/otp/verify", s.handleOTPVerify)
@@ -166,6 +172,108 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// this — resolve reads the PG mapping, and revocation deletes it.
 	http.SetCookie(w, &http.Cookie{Name: "enroll_session", MaxAge: -1, Path: "/"})
 	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
+
+func (s *Server) handleChatGPTLogin(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.currentSession(r)
+	if !ok || sess.VerifiedPhone == "" {
+		http.Error(w, "login and verified number required", http.StatusUnauthorized)
+		return
+	}
+	if s.PublicBaseURL == "" {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	state, err := randHex(16)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	nonce, err := randHex(16)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	verifier, err := NewCodeVerifier()
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_state", Value: state, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_nonce", Value: nonce, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_verifier", Value: verifier, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
+	dest, err := ChatGPTLoginURL(state, nonce, verifier, ChatGPTRedirectURL(s.PublicBaseURL))
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	http.Redirect(w, r, dest, http.StatusFound)
+}
+
+func (s *Server) handleChatGPTCallback(w http.ResponseWriter, r *http.Request) {
+	sess, ok := s.currentSession(r)
+	if !ok || sess.VerifiedPhone == "" {
+		http.Error(w, "login and verified number required", http.StatusUnauthorized)
+		return
+	}
+	q := r.URL.Query()
+	if q.Get("error") != "" {
+		http.Error(w, "login denied", http.StatusUnauthorized)
+		return
+	}
+	st, err := r.Cookie("cgpt_state")
+	nn, err2 := r.Cookie("cgpt_nonce")
+	pkv, err3 := r.Cookie("cgpt_verifier")
+	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
+		http.Error(w, "bad state", http.StatusBadRequest)
+		return
+	}
+	_ = nn // nonce not validated against ChatGPT ID token in this minimal flow
+	tok, err := ExchangeChatGPTCode(r.Context(), s.httpClient, q.Get("code"), pkv.Value, ChatGPTRedirectURL(s.PublicBaseURL))
+	if err != nil {
+		log.Printf("chatgpt callback: exchange failed sub=%s", hashID(sess.Sub))
+		http.Error(w, "login failed", http.StatusUnauthorized)
+		return
+	}
+	if err := s.storeChatGPTCredential(r.Context(), sess.VerifiedPhone, sess.Sub, tok); err != nil {
+		log.Printf("chatgpt callback: store failed sub=%s", hashID(sess.Sub))
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_state", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_nonce", MaxAge: -1, Path: "/"})
+	http.SetCookie(w, &http.Cookie{Name: "cgpt_verifier", MaxAge: -1, Path: "/"})
+	log.Printf("chatgpt connected sub=%s", hashID(sess.Sub))
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+func (s *Server) storeChatGPTCredential(ctx context.Context, phone, sub string, tok ChatGPTTokens) error {
+	e, err := s.store.GetByPhone(ctx, phone)
+	if err != nil {
+		return err
+	}
+	if e == nil || e.UserSub != sub {
+		// Require existing enrollment owned by this sub (created via grant) to
+		// keep PIN/key invariants clear. Fail closed.
+		return errors.New("enrollment required")
+	}
+	if tok.RefreshToken != "" {
+		n, ct, err := s.keys.Encrypt([]byte(tok.RefreshToken))
+		if err != nil {
+			return err
+		}
+		e.EncChatGPTRefresh, e.ChatGPTRefreshNonce = ct, n
+	}
+	n, ct, err := s.keys.Encrypt([]byte(tok.AccessToken))
+	if err != nil {
+		return err
+	}
+	e.EncChatGPTAccess, e.ChatGPTAccessNonce = ct, n
+	e.ChatGPTExpiresAt = tok.ExpiresAt
+	if tok.AccountID != "" {
+		e.ChatGPTAccountID = tok.AccountID
+	}
+	return s.store.UpsertEnrollment(ctx, *e)
 }
 
 type otpSendReq struct {
@@ -394,7 +502,8 @@ func (s *Server) handleListEnrollments(w http.ResponseWriter, r *http.Request) {
 //
 // No bearer auth: the listener is ClusterIP-only (no HTTPRoute) and relies
 // on cluster networking for isolation. Any in-cluster caller can resolve;
-// ?reveal=key returns key material.
+// ?reveal=key returns key material; ?reveal=credential returns per-caller
+// call credential (chatgpt_oauth or legacy api_key) for voice-bridge.
 func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 	phone, err := NormalizeE164(r.URL.Query().Get("phone"))
 	if err != nil {
@@ -410,17 +519,95 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		deny(w)
 		return
 	}
-	out := map[string]string{"user_sub": e.UserSub}
-	if r.URL.Query().Get("reveal") == "key" {
+	reveal := r.URL.Query().Get("reveal")
+	out := map[string]any{"user_sub": e.UserSub}
+	switch reveal {
+	case "key":
+		if len(e.EncKey) == 0 || len(e.Nonce) == 0 {
+			deny(w)
+			return
+		}
 		plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
 		if err != nil {
 			http.Error(w, "unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		out["api_key"] = string(plain)
+	case "credential":
+		cred, err := s.resolveCredential(r.Context(), e)
+		if err != nil {
+			if errors.Is(err, errNoCredential) {
+				deny(w)
+				return
+			}
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		for k, v := range cred {
+			out[k] = v
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(out)
+}
+
+var errNoCredential = errors.New("no credential")
+
+func (s *Server) resolveCredential(ctx context.Context, e *Enrollment) (map[string]any, error) {
+	// Prefer ChatGPT OAuth credential when present.
+	if len(e.EncChatGPTAccess) > 0 && len(e.ChatGPTAccessNonce) > 0 {
+		// Refresh if expired or near expiry.
+		if !e.ChatGPTExpiresAt.IsZero() && time.Now().Add(60*time.Second).After(e.ChatGPTExpiresAt) {
+			if len(e.EncChatGPTRefresh) == 0 || len(e.ChatGPTRefreshNonce) == 0 {
+				return nil, fmt.Errorf("chatgpt refresh unavailable")
+			}
+			rtPlain, err := s.keys.Decrypt(e.ChatGPTRefreshNonce, e.EncChatGPTRefresh)
+			if err != nil {
+				return nil, err
+			}
+			tok, err := RefreshChatGPTToken(ctx, s.httpClient, string(rtPlain))
+			if err != nil {
+				return nil, err
+			}
+			if err := s.storeChatGPTCredential(ctx, e.Phone, e.UserSub, tok); err != nil {
+				return nil, err
+			}
+			// reload for fresh encrypted values/account id
+			fresh, err := s.store.GetByPhone(ctx, e.Phone)
+			if err != nil {
+				return nil, err
+			}
+			if fresh != nil {
+				e = fresh
+			}
+		}
+		atPlain, err := s.keys.Decrypt(e.ChatGPTAccessNonce, e.EncChatGPTAccess)
+		if err != nil {
+			return nil, err
+		}
+		cred := map[string]any{
+			"credential_kind": "chatgpt_oauth",
+			"access_token":    string(atPlain),
+			"expires_at":      e.ChatGPTExpiresAt.UTC().Format(time.RFC3339),
+			"account_id":      e.ChatGPTAccountID,
+		}
+		if len(e.EncChatGPTRefresh) > 0 && len(e.ChatGPTRefreshNonce) > 0 {
+			rtPlain, err := s.keys.Decrypt(e.ChatGPTRefreshNonce, e.EncChatGPTRefresh)
+			if err == nil {
+				cred["refresh_token"] = string(rtPlain)
+			}
+		}
+		return cred, nil
+	}
+	// Legacy API key credential.
+	if len(e.EncKey) > 0 && len(e.Nonce) > 0 {
+		plain, err := s.keys.Decrypt(e.Nonce, e.EncKey)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"credential_kind": "api_key", "api_key": string(plain)}, nil
+	}
+	return nil, errNoCredential
 }
 
 // handleVerifyPIN is the internal per-caller PIN check the voice path uses

@@ -3,6 +3,7 @@ package enroll
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -40,6 +41,14 @@ CREATE TABLE IF NOT EXISTS enrollments (
 );
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_pin BYTEA;
 ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS pin_nonce BYTEA;
+ALTER TABLE enrollments ALTER COLUMN enc_key DROP NOT NULL;
+ALTER TABLE enrollments ALTER COLUMN nonce DROP NOT NULL;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_chatgpt_refresh BYTEA;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS chatgpt_refresh_nonce BYTEA;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS enc_chatgpt_access BYTEA;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS chatgpt_access_nonce BYTEA;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS chatgpt_expires_at TIMESTAMPTZ;
+ALTER TABLE enrollments ADD COLUMN IF NOT EXISTS chatgpt_account_id TEXT;
 CREATE TABLE IF NOT EXISTS otp_codes (
   phone        TEXT PRIMARY KEY,
   code_hash    BYTEA NOT NULL,
@@ -84,25 +93,38 @@ ON CONFLICT (phone) DO UPDATE SET
 
 func (s *PGStore) UpsertEnrollment(ctx context.Context, e Enrollment) error {
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO enrollments (phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at, updated_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+INSERT INTO enrollments (phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at,
+  enc_chatgpt_refresh, chatgpt_refresh_nonce, enc_chatgpt_access, chatgpt_access_nonce, chatgpt_expires_at, chatgpt_account_id, updated_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,now())
 ON CONFLICT (phone) DO UPDATE SET
   user_sub=EXCLUDED.user_sub, enc_key=EXCLUDED.enc_key, nonce=EXCLUDED.nonce,
   enc_pin=EXCLUDED.enc_pin, pin_nonce=EXCLUDED.pin_nonce,
-  verified_at=EXCLUDED.verified_at, updated_at=now()`,
-		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.EncPIN, e.PINNonce, e.VerifiedAt)
+  verified_at=EXCLUDED.verified_at,
+  enc_chatgpt_refresh=EXCLUDED.enc_chatgpt_refresh, chatgpt_refresh_nonce=EXCLUDED.chatgpt_refresh_nonce,
+  enc_chatgpt_access=EXCLUDED.enc_chatgpt_access, chatgpt_access_nonce=EXCLUDED.chatgpt_access_nonce,
+  chatgpt_expires_at=EXCLUDED.chatgpt_expires_at, chatgpt_account_id=EXCLUDED.chatgpt_account_id,
+  updated_at=now()`,
+		e.Phone, e.UserSub, e.EncKey, e.Nonce, e.EncPIN, e.PINNonce, e.VerifiedAt,
+		e.EncChatGPTRefresh, e.ChatGPTRefreshNonce, e.EncChatGPTAccess, e.ChatGPTAccessNonce, nullTime(e.ChatGPTExpiresAt), e.ChatGPTAccountID)
 	return err
 }
 
 func (s *PGStore) GetByPhone(ctx context.Context, phone string) (*Enrollment, error) {
 	var e Enrollment
-	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at
-FROM enrollments WHERE phone=$1`, phone).Scan(&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce, &e.EncPIN, &e.PINNonce, &e.VerifiedAt)
+	var expiresAt *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT phone, user_sub, enc_key, nonce, enc_pin, pin_nonce, verified_at,
+  enc_chatgpt_refresh, chatgpt_refresh_nonce, enc_chatgpt_access, chatgpt_access_nonce, chatgpt_expires_at, chatgpt_account_id
+FROM enrollments WHERE phone=$1`, phone).Scan(
+		&e.Phone, &e.UserSub, &e.EncKey, &e.Nonce, &e.EncPIN, &e.PINNonce, &e.VerifiedAt,
+		&e.EncChatGPTRefresh, &e.ChatGPTRefreshNonce, &e.EncChatGPTAccess, &e.ChatGPTAccessNonce, &expiresAt, &e.ChatGPTAccountID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
+	}
+	if expiresAt != nil {
+		e.ChatGPTExpiresAt = *expiresAt
 	}
 	return &e, nil
 }
@@ -130,4 +152,11 @@ func (s *PGStore) DeleteEnrollment(ctx context.Context, phone, sub string) (bool
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
+}
+
+func nullTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }

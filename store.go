@@ -22,6 +22,10 @@ import (
 // plaintext at rest) and is only ever compared inside verify-pin or
 // decrypted for that comparison. It never appears in resolve responses
 // or logs.
+//
+// ChatGPT OAuth note: refresh/access tokens are encrypted under the same DEK.
+// Access tokens are short-lived and may be refreshed on reveal; refresh token
+// rotates only when the provider returns a new one. Tokens never appear in logs.
 type Enrollment struct {
 	Phone      string // normalized E.164
 	UserSub    string // Kanidm `sub` from the verified login session
@@ -30,6 +34,14 @@ type Enrollment struct {
 	EncPIN     []byte // AES-GCM ciphertext of the voice PIN
 	PINNonce   []byte
 	VerifiedAt time.Time
+
+	// ChatGPT OAuth (optional). All secret fields encrypted under DEK.
+	EncChatGPTRefresh   []byte
+	ChatGPTRefreshNonce []byte
+	EncChatGPTAccess    []byte
+	ChatGPTAccessNonce  []byte
+	ChatGPTExpiresAt    time.Time
+	ChatGPTAccountID    string
 }
 
 // Store is the enrollment directory. Postgres is the deploy backend;

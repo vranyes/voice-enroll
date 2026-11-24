@@ -43,6 +43,7 @@ func main() {
 	}
 	sms := &enroll.TelnyxSender{APIKey: cfg.TelnyxKey}
 	srv := enroll.NewServer(store, cfg.OIDC, codec, keys, sms, cfg.TelnyxSender, cfg.LibreChatBase)
+	srv.PublicBaseURL = cfg.PublicBaseURL
 
 	pub := &http.Server{Addr: cfg.Addr, Handler: srv.PublicMux(), ReadHeaderTimeout: 5 * time.Second}
 	priv := &http.Server{Addr: cfg.InternalAddr, Handler: srv.InternalMux(), ReadHeaderTimeout: 5 * time.Second}
