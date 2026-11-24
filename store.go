@@ -49,6 +49,16 @@ type Enrollment struct {
 type Store interface {
 	OTPStore
 	UpsertEnrollment(ctx context.Context, e Enrollment) error
+	// UpdateChatGPTTokens replaces only the OAuth credential columns of an
+	// existing (phone, sub) row and reports whether a matching row existed.
+	// Partial updates exist so connect/refresh and grant do not clobber each
+	// other by writing back whole rows read before the other writer ran.
+	UpdateChatGPTTokens(ctx context.Context, phone, sub string, encRefresh, refreshNonce, encAccess, accessNonce []byte, expiresAt time.Time, accountID string) (bool, error)
+	// UpdateKeyAndPIN replaces the key and PIN columns of an existing
+	// (phone, sub) row, leaving any OAuth credential untouched.
+	UpdateKeyAndPIN(ctx context.Context, phone, sub string, encKey, keyNonce, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error)
+	// UpdatePIN replaces only the PIN columns of an existing (phone, sub) row.
+	UpdatePIN(ctx context.Context, phone, sub string, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error)
 	GetByPhone(ctx context.Context, phone string) (*Enrollment, error)
 	// ListBySub returns every enrollment owned by sub, ordered by phone.
 	// It backs the self-service "my numbers" list so a user who verifies a
@@ -92,6 +102,48 @@ func (s *memoryStore) UpsertEnrollment(_ context.Context, e Enrollment) error {
 	defer s.mu.Unlock()
 	s.enrol[e.Phone] = e
 	return nil
+}
+
+func (s *memoryStore) UpdateChatGPTTokens(_ context.Context, phone, sub string, encRefresh, refreshNonce, encAccess, accessNonce []byte, expiresAt time.Time, accountID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.enrol[phone]
+	if !ok || e.UserSub != sub {
+		return false, nil
+	}
+	e.EncChatGPTRefresh, e.ChatGPTRefreshNonce = encRefresh, refreshNonce
+	e.EncChatGPTAccess, e.ChatGPTAccessNonce = encAccess, accessNonce
+	e.ChatGPTExpiresAt = expiresAt
+	e.ChatGPTAccountID = accountID
+	s.enrol[phone] = e
+	return true, nil
+}
+
+func (s *memoryStore) UpdateKeyAndPIN(_ context.Context, phone, sub string, encKey, keyNonce, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.enrol[phone]
+	if !ok || e.UserSub != sub {
+		return false, nil
+	}
+	e.EncKey, e.Nonce = encKey, keyNonce
+	e.EncPIN, e.PINNonce = encPIN, pinNonce
+	e.VerifiedAt = verifiedAt
+	s.enrol[phone] = e
+	return true, nil
+}
+
+func (s *memoryStore) UpdatePIN(_ context.Context, phone, sub string, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.enrol[phone]
+	if !ok || e.UserSub != sub {
+		return false, nil
+	}
+	e.EncPIN, e.PINNonce = encPIN, pinNonce
+	e.VerifiedAt = verifiedAt
+	s.enrol[phone] = e
+	return true, nil
 }
 
 func (s *memoryStore) GetByPhone(_ context.Context, phone string) (*Enrollment, error) {

@@ -109,6 +109,45 @@ ON CONFLICT (phone) DO UPDATE SET
 	return err
 }
 
+func (s *PGStore) UpdateChatGPTTokens(ctx context.Context, phone, sub string, encRefresh, refreshNonce, encAccess, accessNonce []byte, expiresAt time.Time, accountID string) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE enrollments SET
+  enc_chatgpt_refresh=$3, chatgpt_refresh_nonce=$4,
+  enc_chatgpt_access=$5, chatgpt_access_nonce=$6,
+  chatgpt_expires_at=$7,
+  chatgpt_account_id=COALESCE(NULLIF($8,''), chatgpt_account_id),
+  updated_at=now()
+WHERE phone=$1 AND user_sub=$2`,
+		phone, sub, encRefresh, refreshNonce, encAccess, accessNonce, nullTime(expiresAt), accountID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PGStore) UpdateKeyAndPIN(ctx context.Context, phone, sub string, encKey, keyNonce, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE enrollments SET
+  enc_key=$3, nonce=$4, enc_pin=$5, pin_nonce=$6, verified_at=$7, updated_at=now()
+WHERE phone=$1 AND user_sub=$2`,
+		phone, sub, encKey, keyNonce, encPIN, pinNonce, verifiedAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func (s *PGStore) UpdatePIN(ctx context.Context, phone, sub string, encPIN, pinNonce []byte, verifiedAt time.Time) (bool, error) {
+	tag, err := s.pool.Exec(ctx, `
+UPDATE enrollments SET enc_pin=$3, pin_nonce=$4, verified_at=$5, updated_at=now()
+WHERE phone=$1 AND user_sub=$2`,
+		phone, sub, encPIN, pinNonce, verifiedAt)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
 func (s *PGStore) GetByPhone(ctx context.Context, phone string) (*Enrollment, error) {
 	var e Enrollment
 	var expiresAt *time.Time

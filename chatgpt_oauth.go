@@ -41,7 +41,11 @@ func ChatGPTRedirectURL(publicBaseURL string) string {
 	return strings.TrimRight(publicBaseURL, "/") + ChatGPTRedirectPath
 }
 
-func ChatGPTLoginURL(state, nonce, verifier, redirectURI string) (string, error) {
+// ChatGPTLoginURL builds the authorize URL. No OIDC nonce is sent: the
+// id_token is not used for identity here (the credential is the token itself,
+// obtained from the TLS-protected code exchange), so there is nothing for a
+// nonce to bind.
+func ChatGPTLoginURL(state, verifier, redirectURI string) string {
 	challenge := CodeChallengeS256(verifier)
 	v := url.Values{}
 	v.Set("response_type", "code")
@@ -51,36 +55,38 @@ func ChatGPTLoginURL(state, nonce, verifier, redirectURI string) (string, error)
 	v.Set("code_challenge", challenge)
 	v.Set("code_challenge_method", "S256")
 	v.Set("state", state)
-	v.Set("nonce", nonce)
 	v.Set("id_token_add_organizations", "true")
 	v.Set("codex_cli_simplified_flow", "true")
 	v.Set("originator", "voice-enroll")
-	return ChatGPTAuthorizeURL + "?" + v.Encode(), nil
+	return ChatGPTAuthorizeURL + "?" + v.Encode()
 }
 
-func ExchangeChatGPTCode(ctx context.Context, hc *http.Client, code, verifier, redirectURI string) (ChatGPTTokens, error) {
+func exchangeChatGPTCode(ctx context.Context, hc *http.Client, tokenURL, code, verifier, redirectURI string) (ChatGPTTokens, error) {
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", ChatGPTClientID)
 	form.Set("code", code)
 	form.Set("redirect_uri", redirectURI)
 	form.Set("code_verifier", verifier)
-	return postChatGPTToken(ctx, hc, form, "")
+	return postChatGPTToken(ctx, hc, tokenURL, form, "")
 }
 
-func RefreshChatGPTToken(ctx context.Context, hc *http.Client, refreshToken string) (ChatGPTTokens, error) {
+func refreshChatGPTToken(ctx context.Context, hc *http.Client, tokenURL, refreshToken string) (ChatGPTTokens, error) {
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", ChatGPTClientID)
-	return postChatGPTToken(ctx, hc, form, refreshToken)
+	return postChatGPTToken(ctx, hc, tokenURL, form, refreshToken)
 }
 
-func postChatGPTToken(ctx context.Context, hc *http.Client, form url.Values, fallbackRefresh string) (ChatGPTTokens, error) {
+func postChatGPTToken(ctx context.Context, hc *http.Client, tokenURL string, form url.Values, fallbackRefresh string) (ChatGPTTokens, error) {
 	if hc == nil {
 		hc = &http.Client{Timeout: 15 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ChatGPTTokenURL, strings.NewReader(form.Encode()))
+	if tokenURL == "" {
+		tokenURL = ChatGPTTokenURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return ChatGPTTokens{}, err
 	}

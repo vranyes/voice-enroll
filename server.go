@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"html"
 	"log"
 	"net/http"
@@ -28,18 +27,21 @@ type Server struct {
 	smsFrom       string
 	libreChat     string
 	PublicBaseURL string
-	httpClient    *http.Client
-	now           func() time.Time
-	sessionTTL    time.Duration
+	// chatGPTTokenURL overrides the ChatGPT token endpoint in tests.
+	chatGPTTokenURL string
+	httpClient      *http.Client
+	now             func() time.Time
+	sessionTTL      time.Duration
 }
 
 func NewServer(store Store, oidc OIDCConfig, sessions *SessionCodec, keys *Key, sms SMSSender, smsFrom, libreChat string) *Server {
 	return &Server{
 		store: store, oidc: oidc, sessions: sessions, keys: keys,
 		sms: sms, smsFrom: smsFrom, libreChat: libreChat,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		now:        time.Now,
-		sessionTTL: 12 * time.Hour,
+		chatGPTTokenURL: ChatGPTTokenURL,
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		now:             time.Now,
+		sessionTTL:      12 * time.Hour,
 	}
 }
 
@@ -189,25 +191,14 @@ func (s *Server) handleChatGPTLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	nonce, err := randHex(16)
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
 	verifier, err := NewCodeVerifier()
 	if err != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "cgpt_state", Value: state, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	http.SetCookie(w, &http.Cookie{Name: "cgpt_nonce", Value: nonce, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
 	http.SetCookie(w, &http.Cookie{Name: "cgpt_verifier", Value: verifier, Path: "/", HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: 600})
-	dest, err := ChatGPTLoginURL(state, nonce, verifier, ChatGPTRedirectURL(s.PublicBaseURL))
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
-	http.Redirect(w, r, dest, http.StatusFound)
+	http.Redirect(w, r, ChatGPTLoginURL(state, verifier, ChatGPTRedirectURL(s.PublicBaseURL)), http.StatusFound)
 }
 
 func (s *Server) handleChatGPTCallback(w http.ResponseWriter, r *http.Request) {
@@ -221,15 +212,13 @@ func (s *Server) handleChatGPTCallback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "login denied", http.StatusUnauthorized)
 		return
 	}
-	st, err := r.Cookie("cgpt_state")
-	nn, err2 := r.Cookie("cgpt_nonce")
-	pkv, err3 := r.Cookie("cgpt_verifier")
-	if err != nil || err2 != nil || err3 != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
+	st, stateErr := r.Cookie("cgpt_state")
+	pkv, verifierErr := r.Cookie("cgpt_verifier")
+	if stateErr != nil || verifierErr != nil || pkv.Value == "" || subtle.ConstantTimeCompare([]byte(q.Get("state")), []byte(st.Value)) != 1 {
 		http.Error(w, "bad state", http.StatusBadRequest)
 		return
 	}
-	_ = nn // nonce not validated against ChatGPT ID token in this minimal flow
-	tok, err := ExchangeChatGPTCode(r.Context(), s.httpClient, q.Get("code"), pkv.Value, ChatGPTRedirectURL(s.PublicBaseURL))
+	tok, err := exchangeChatGPTCode(r.Context(), s.httpClient, s.chatGPTTokenURL, q.Get("code"), pkv.Value, ChatGPTRedirectURL(s.PublicBaseURL))
 	if err != nil {
 		log.Printf("chatgpt callback: exchange failed sub=%s", hashID(sess.Sub))
 		http.Error(w, "login failed", http.StatusUnauthorized)
@@ -241,39 +230,64 @@ func (s *Server) handleChatGPTCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: "cgpt_state", MaxAge: -1, Path: "/"})
-	http.SetCookie(w, &http.Cookie{Name: "cgpt_nonce", MaxAge: -1, Path: "/"})
 	http.SetCookie(w, &http.Cookie{Name: "cgpt_verifier", MaxAge: -1, Path: "/"})
 	log.Printf("chatgpt connected sub=%s", hashID(sess.Sub))
-	http.Redirect(w, r, "/", http.StatusFound)
+	http.Redirect(w, r, "/?chatgpt=connected", http.StatusFound)
 }
 
+// storeChatGPTCredential persists the OAuth tokens for phone. A row may not
+// exist yet: connecting ChatGPT is a valid first step, and the row stays
+// "pending" (no PIN) so the admit gate in handleResolve continues to deny
+// until the user completes grant with a voice PIN. Ownership is decided by
+// the OTP-verified session (the caller passes sess.VerifiedPhone), so a row
+// left behind by a previous owner is replaced.
 func (s *Server) storeChatGPTCredential(ctx context.Context, phone, sub string, tok ChatGPTTokens) error {
 	e, err := s.store.GetByPhone(ctx, phone)
 	if err != nil {
 		return err
 	}
-	if e == nil || e.UserSub != sub {
-		// Require existing enrollment owned by this sub (created via grant) to
-		// keep PIN/key invariants clear. Fail closed.
-		return errors.New("enrollment required")
-	}
-	if tok.RefreshToken != "" {
-		n, ct, err := s.keys.Encrypt([]byte(tok.RefreshToken))
-		if err != nil {
-			return err
-		}
-		e.EncChatGPTRefresh, e.ChatGPTRefreshNonce = ct, n
-	}
-	n, ct, err := s.keys.Encrypt([]byte(tok.AccessToken))
+
+	eAccessNonce, eAccess, err := s.keys.Encrypt([]byte(tok.AccessToken))
 	if err != nil {
 		return err
 	}
-	e.EncChatGPTAccess, e.ChatGPTAccessNonce = ct, n
-	e.ChatGPTExpiresAt = tok.ExpiresAt
-	if tok.AccountID != "" {
-		e.ChatGPTAccountID = tok.AccountID
+	var eRefreshNonce, eRefresh []byte
+	switch {
+	case tok.RefreshToken != "":
+		eRefreshNonce, eRefresh, err = s.keys.Encrypt([]byte(tok.RefreshToken))
+		if err != nil {
+			return err
+		}
+	case e != nil && e.UserSub == sub:
+		// Provider did not rotate the refresh token: keep the stored one
+		// instead of nulling the column.
+		eRefresh, eRefreshNonce = e.EncChatGPTRefresh, e.ChatGPTRefreshNonce
 	}
-	return s.store.UpsertEnrollment(ctx, *e)
+
+	if e != nil && e.UserSub == sub {
+		accountID := tok.AccountID
+		if accountID == "" {
+			accountID = e.ChatGPTAccountID
+		}
+		ok, err := s.store.UpdateChatGPTTokens(ctx, phone, sub,
+			eRefresh, eRefreshNonce, eAccess, eAccessNonce, tok.ExpiresAt, accountID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("enrollment changed")
+		}
+		return nil
+	}
+
+	// No row, or one owned by a previous owner: replace it with a pending
+	// row for this OTP-verified subject.
+	return s.store.UpsertEnrollment(ctx, Enrollment{
+		Phone: phone, UserSub: sub, VerifiedAt: s.now(),
+		EncChatGPTRefresh: eRefresh, ChatGPTRefreshNonce: eRefreshNonce,
+		EncChatGPTAccess: eAccess, ChatGPTAccessNonce: eAccessNonce,
+		ChatGPTExpiresAt: tok.ExpiresAt, ChatGPTAccountID: tok.AccountID,
+	})
 }
 
 type otpSendReq struct {
@@ -373,7 +387,7 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	key := strings.TrimSpace(req.APIKey)
-	if key == "" || len(key) > 4096 {
+	if len(key) > 4096 {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
@@ -382,7 +396,29 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid PIN: need 4-12 digits", http.StatusBadRequest)
 		return
 	}
-	if err := VerifyLibreChatKey(r.Context(), s.httpClient, s.libreChat, key); err != nil {
+	phone := phoneOf(sess)
+
+	// Load any existing row so a same-subject update can target only the
+	// columns it owns: a grant does not rewrite the OAuth credential columns,
+	// so a concurrent token refresh cannot be clobbered (and vice versa).
+	// A row owned by another subject is replaced by a full upsert: the
+	// session's OTP proves ownership of the number now.
+	existing, err := s.store.GetByPhone(r.Context(), phone)
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	sameOwner := existing != nil && existing.UserSub == sess.Sub
+
+	if key == "" {
+		// OAuth-only grant: the user connected ChatGPT first, which created
+		// (or updated) the pending row. Refuse if that credential is missing
+		// or belongs to someone else.
+		if !sameOwner || !hasChatGPTCredential(existing) {
+			http.Error(w, "connect ChatGPT first", http.StatusBadRequest)
+			return
+		}
+	} else if err := VerifyLibreChatKey(r.Context(), s.httpClient, s.libreChat, key); err != nil {
 		if err == ErrInvalidKey {
 			http.Error(w, "key rejected by LibreChat", http.StatusBadRequest)
 			return
@@ -390,21 +426,44 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "verification unavailable", http.StatusBadGateway)
 		return
 	}
-	nonce, ct, err := s.keys.Encrypt([]byte(key))
-	if err != nil {
-		http.Error(w, "unavailable", http.StatusServiceUnavailable)
-		return
-	}
+
 	pinNonce, pinCT, err := s.keys.Encrypt([]byte(pin))
 	if err != nil {
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if err := s.store.UpsertEnrollment(r.Context(), Enrollment{
-		Phone: phoneOf(sess), UserSub: sess.Sub,
-		EncKey: ct, Nonce: nonce, EncPIN: pinCT, PINNonce: pinNonce,
-		VerifiedAt: s.now(),
-	}); err != nil {
+	now := s.now()
+
+	var stored bool
+	switch {
+	case key == "":
+		stored, err = s.store.UpdatePIN(r.Context(), phone, sess.Sub, pinCT, pinNonce, now)
+	case sameOwner:
+		keyNonce, keyCT, encErr := s.keys.Encrypt([]byte(key))
+		if encErr != nil {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		stored, err = s.store.UpdateKeyAndPIN(r.Context(), phone, sess.Sub, keyCT, keyNonce, pinCT, pinNonce, now)
+	default:
+		keyNonce, keyCT, encErr := s.keys.Encrypt([]byte(key))
+		if encErr != nil {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		err = s.store.UpsertEnrollment(r.Context(), Enrollment{
+			Phone: phone, UserSub: sess.Sub,
+			EncKey: keyCT, Nonce: keyNonce, EncPIN: pinCT, PINNonce: pinNonce,
+			VerifiedAt: now,
+		})
+		stored = err == nil
+	}
+	if err != nil {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if !stored {
+		// The row disappeared or changed owner between load and update.
 		http.Error(w, "unavailable", http.StatusServiceUnavailable)
 		return
 	}
@@ -418,6 +477,17 @@ func (s *Server) handleGrant(w http.ResponseWriter, r *http.Request) {
 }
 
 func phoneOf(sess Session) string { return sess.VerifiedPhone }
+
+// hasPIN reports whether the row is a complete enrollment. Rows without a
+// PIN are pending (ChatGPT connected, grant not finished) and must not admit
+// calls or reveal credentials.
+func hasPIN(e *Enrollment) bool {
+	return e != nil && len(e.EncPIN) > 0 && len(e.PINNonce) > 0
+}
+
+func hasChatGPTCredential(e *Enrollment) bool {
+	return e != nil && len(e.EncChatGPTAccess) > 0 && len(e.ChatGPTAccessNonce) > 0
+}
 
 func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	sess, ok := s.currentSession(r)
@@ -486,10 +556,24 @@ func (s *Server) handleListEnrollments(w http.ResponseWriter, r *http.Request) {
 	type entry struct {
 		Phone      string `json:"phone"`
 		VerifiedAt string `json:"verified_at"`
+		Active     bool   `json:"active"`
+		Credential string `json:"credential"`
 	}
 	out := make([]entry, 0, len(rows))
 	for _, e := range rows {
-		out = append(out, entry{Phone: e.Phone, VerifiedAt: e.VerifiedAt.UTC().Format(time.RFC3339)})
+		cred := ""
+		switch {
+		case hasChatGPTCredential(&e):
+			cred = "chatgpt_oauth"
+		case len(e.EncKey) > 0 && len(e.Nonce) > 0:
+			cred = "api_key"
+		}
+		out = append(out, entry{
+			Phone:      e.Phone,
+			VerifiedAt: e.VerifiedAt.UTC().Format(time.RFC3339),
+			Active:     hasPIN(&e),
+			Credential: cred,
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{"phones": out})
@@ -516,6 +600,14 @@ func (s *Server) handleResolve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e == nil {
+		deny(w)
+		return
+	}
+	// Pending enrollments (ChatGPT connected but no voice PIN yet) must not
+	// admit calls: the admit gate is this lookup, so require the PIN here as
+	// well as in verify-pin. A row without a PIN is indistinguishable from an
+	// unknown number.
+	if !hasPIN(e) {
 		deny(w)
 		return
 	}
@@ -555,47 +647,55 @@ var errNoCredential = errors.New("no credential")
 
 func (s *Server) resolveCredential(ctx context.Context, e *Enrollment) (map[string]any, error) {
 	// Prefer ChatGPT OAuth credential when present.
-	if len(e.EncChatGPTAccess) > 0 && len(e.ChatGPTAccessNonce) > 0 {
-		// Refresh if expired or near expiry.
-		if !e.ChatGPTExpiresAt.IsZero() && time.Now().Add(60*time.Second).After(e.ChatGPTExpiresAt) {
-			if len(e.EncChatGPTRefresh) == 0 || len(e.ChatGPTRefreshNonce) == 0 {
-				return nil, fmt.Errorf("chatgpt refresh unavailable")
+	if hasChatGPTCredential(e) {
+		access, refresh := "", ""
+		expiresAt, accountID := e.ChatGPTExpiresAt, e.ChatGPTAccountID
+		if len(e.EncChatGPTRefresh) > 0 && len(e.ChatGPTRefreshNonce) > 0 {
+			if rt, err := s.keys.Decrypt(e.ChatGPTRefreshNonce, e.EncChatGPTRefresh); err == nil {
+				refresh = string(rt)
 			}
-			rtPlain, err := s.keys.Decrypt(e.ChatGPTRefreshNonce, e.EncChatGPTRefresh)
-			if err != nil {
-				return nil, err
+		}
+		if !expiresAt.IsZero() && time.Now().Add(60*time.Second).After(expiresAt) {
+			// Expired or about to expire. Without a refresh token the
+			// credential is unusable: deny like an unknown number.
+			if refresh == "" {
+				return nil, errNoCredential
 			}
-			tok, err := RefreshChatGPTToken(ctx, s.httpClient, string(rtPlain))
+			tok, err := refreshChatGPTToken(ctx, s.httpClient, s.chatGPTTokenURL, refresh)
 			if err != nil {
-				return nil, err
+				// Dead or unusable refresh token: fail closed and deny,
+				// rather than surfacing a retryable 5xx on every call. The
+				// user reconnects ChatGPT from the UI.
+				return nil, errNoCredential
 			}
 			if err := s.storeChatGPTCredential(ctx, e.Phone, e.UserSub, tok); err != nil {
 				return nil, err
 			}
-			// reload for fresh encrypted values/account id
-			fresh, err := s.store.GetByPhone(ctx, e.Phone)
+			// Answer with the tokens just minted. Do not re-read the row:
+			// a concurrent delete would otherwise make us serve the old,
+			// already-expired access token.
+			access, expiresAt = tok.AccessToken, tok.ExpiresAt
+			if tok.RefreshToken != "" {
+				refresh = tok.RefreshToken
+			}
+			if tok.AccountID != "" {
+				accountID = tok.AccountID
+			}
+		} else {
+			at, err := s.keys.Decrypt(e.ChatGPTAccessNonce, e.EncChatGPTAccess)
 			if err != nil {
 				return nil, err
 			}
-			if fresh != nil {
-				e = fresh
-			}
-		}
-		atPlain, err := s.keys.Decrypt(e.ChatGPTAccessNonce, e.EncChatGPTAccess)
-		if err != nil {
-			return nil, err
+			access = string(at)
 		}
 		cred := map[string]any{
 			"credential_kind": "chatgpt_oauth",
-			"access_token":    string(atPlain),
-			"expires_at":      e.ChatGPTExpiresAt.UTC().Format(time.RFC3339),
-			"account_id":      e.ChatGPTAccountID,
+			"access_token":    access,
+			"expires_at":      expiresAt.UTC().Format(time.RFC3339),
+			"account_id":      accountID,
 		}
-		if len(e.EncChatGPTRefresh) > 0 && len(e.ChatGPTRefreshNonce) > 0 {
-			rtPlain, err := s.keys.Decrypt(e.ChatGPTRefreshNonce, e.EncChatGPTRefresh)
-			if err == nil {
-				cred["refresh_token"] = string(rtPlain)
-			}
+		if refresh != "" {
+			cred["refresh_token"] = refresh
 		}
 		return cred, nil
 	}
@@ -711,6 +811,14 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// reload — window.__verifiedPhone carries that state).
 	// sess.VerifiedPhone is E.164 ("+" + digits) by construction, so it is
 	// safe to embed in a quoted JS string.
+	// If the verified number already has ChatGPT tokens, the grant card asks
+	// only for a PIN: that is the OAuth-only path (connect, then grant).
+	chatGPTConnected := false
+	if loggedIn && sess.VerifiedPhone != "" {
+		if e, err := s.store.GetByPhone(r.Context(), sess.VerifiedPhone); err == nil && e != nil && e.UserSub == sess.Sub {
+			chatGPTConnected = hasChatGPTCredential(e)
+		}
+	}
 	if !loggedIn {
 		b.WriteString(`<div class="card"><h2>Step 1 — Log in</h2>` +
 			`<p class="sub">Kanidm confirms who you are.</p>` +
@@ -721,20 +829,26 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			enrollHidden, grantHidden = " hidden", ""
 			grantPhone = html.EscapeString(sess.VerifiedPhone)
 		}
+		grantCard := `<div class="card" id="grantCard"` + grantHidden + `><h2>Step 3 — Grant voice access</h2>` +
+			`<p><span class="pill" id="grantPhone">` + grantPhone + `</span></p>`
+		if chatGPTConnected {
+			grantCard += `<p class="sub" id="cgptStatus"><span class="pill">ChatGPT connected</span> <a href="/oauth/chatgpt/login">Reconnect</a></p>` +
+				`<p class="sub">Choose a 4-12 digit voice PIN for call-time identification.</p>`
+		} else {
+			grantCard += `<p class="sub">Paste a LibreChat Remote Agents API key, or connect your ChatGPT account. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
+				`<label for="apikey">LibreChat API key</label>` +
+				`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
+				`<p class="sub"><a href="/oauth/chatgpt/login">Or connect ChatGPT instead</a></p>`
+		}
+		grantCard += `<label for="pin">Voice PIN (4-12 digits)</label>` +
+			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
+			`<div class="row"><button id="grant">Grant access</button>` +
+			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>`
 		b.WriteString(enrolledCard +
 			`<div class="card" id="enrollCard"` + enrollHidden + `><h2>Enroll new phone number</h2>` +
 			`<p class="sub">Verify ownership via SMS, then grant voice access. Numbers you already enrolled stay active.</p>` +
 			`<div class="row"><button id="enrollNew">Enroll new phone number</button></div></div>` +
-			verifyCard(true) +
-			`<div class="card" id="grantCard"` + grantHidden + `><h2>Step 3 — Grant voice access</h2>` +
-			`<p><span class="pill" id="grantPhone">` + grantPhone + `</span></p>` +
-			`<p class="sub">Paste a LibreChat Remote Agents API key. Verified live, stored encrypted. Choose a 4-12 digit voice PIN for call-time identification.</p>` +
-			`<label for="apikey">LibreChat API key</label>` +
-			`<input id="apikey" type="password" autocomplete="off" placeholder="lc-…">` +
-			`<label for="pin">Voice PIN (4-12 digits)</label>` +
-			`<input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="482916" maxlength="12">` +
-			`<div class="row"><button id="grant">Grant access</button>` +
-			`<button id="useDifferent" class="secondary">Use a different number</button></div></div>` +
+			verifyCard(true) + grantCard +
 			`<div class="row"><form method="post" action="/logout"><button class="secondary" type="submit">Log out</button></form></div>`)
 	}
 	b.WriteString(`</main><script>
@@ -761,6 +875,20 @@ async function refreshEnrolled(){
     data.phones.forEach(function(p){
       const li=document.createElement('li');
       li.appendChild(document.createTextNode(p.phone+' '));
+      if(p.credential){
+        const tag=document.createElement('span');
+        tag.className='pill';
+        tag.textContent=p.credential==='chatgpt_oauth'?'ChatGPT':'API key';
+        li.appendChild(tag);
+        li.appendChild(document.createTextNode(' '));
+      }
+      if(!p.active){
+        const tag=document.createElement('span');
+        tag.className='pill';
+        tag.textContent='pending';
+        li.appendChild(tag);
+        li.appendChild(document.createTextNode(' '));
+      }
       const btn=document.createElement('button');
       btn.textContent='Remove';
       btn.className='secondary';
@@ -772,6 +900,7 @@ async function refreshEnrolled(){
   }catch(e){box.textContent='Could not load enrolled numbers.';}
 }
 refreshEnrolled();
+if(new URLSearchParams(location.search).get('chatgpt')==='connected'){say('ChatGPT connected — set a voice PIN to finish.','ok');}
 function show(el,on){if(el)el.hidden=!on;}
 const enrollNew=document.getElementById('enrollNew');
 if(enrollNew)enrollNew.onclick=()=>{show(document.getElementById('verifyCard'),true);show(document.getElementById('enrollCard'),false);};
@@ -782,7 +911,7 @@ if(send)send.onclick=async()=>{say('Sending…');try{await post('/api/otp/send',
 const verify=document.getElementById('verify');
 if(verify)verify.onclick=async()=>{say('Verifying…');try{const p=phoneVal();const c=document.getElementById('code').value;await post('/api/otp/verify',{phone:p,code:c});window.__verifiedPhone=p;const gp=document.getElementById('grantPhone');if(gp)gp.textContent=p;show(document.getElementById('verifyCard'),false);show(document.getElementById('enrollCard'),false);show(document.getElementById('grantCard'),true);say('Verified — grant voice access below.','ok');}catch(e){say(e.message,'err');}};
 const grant=document.getElementById('grant');
-if(grant)grant.onclick=async()=>{say('Verifying key…');try{await post('/api/grant',{api_key:document.getElementById('apikey').value,pin:document.getElementById('pin').value});window.__verifiedPhone='';const ak=document.getElementById('apikey');if(ak)ak.value='';const pk=document.getElementById('pin');if(pk)pk.value='';show(document.getElementById('grantCard'),false);show(document.getElementById('enrollCard'),true);say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
+if(grant)grant.onclick=async()=>{say('Granting…');try{const ak=document.getElementById('apikey');await post('/api/grant',{api_key:ak?ak.value:'',pin:document.getElementById('pin').value});window.__verifiedPhone='';if(ak)ak.value='';const pk=document.getElementById('pin');if(pk)pk.value='';show(document.getElementById('grantCard'),false);show(document.getElementById('enrollCard'),true);say('Voice access granted.','ok');refreshEnrolled();}catch(e){say(e.message,'err');}};
 </script></body></html>`)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(b.String()))
